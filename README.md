@@ -1,5 +1,7 @@
 # Remote Claude
 
+**Self-hosted Claude Code infrastructure for teams and solo developers.**
+
 Remote Claude is a self-hosted SSH bridge for [Claude Code](https://code.claude.com/). It runs the Claude Code interface and conversation state on a Linux server you control, while a workstation can keep ownership of the project files, commands, builds, hooks and MCP servers. A separate server mode runs a committed task entirely on the server, inside tmux and Docker, so the workstation can disconnect.
 
 The same Go executable provides the workstation client, the server, the temporary SSH/SFTP bridge and command dispatcher. No inbound port, SSH server, Node.js or Python installation is required on the workstation.
@@ -21,6 +23,12 @@ The same Go executable provides the workstation client, the server, the temporar
 Where the organization's Claude terms and subscription permit this deployment, keeping Claude Code on a single administrator-managed host with a controlled egress path gives the team one consistent managed environment and network route instead of frequent ad-hoc workstation and network changes. It can reduce manual sign-in and refresh churn and make access administration easier to audit.
 
 This reduces operational variability only. It does not prevent provider enforcement, authorize account sharing, remove human oversight, or override subscription or device rules.
+
+## For teams and solo developers
+
+**For teams.** Remote Claude is shared operational infrastructure: central provisioning and revocation of managed accounts, consistent administrator-managed Claude environments and egress, resource policies, and managed client updates. Each developer works through their own managed server account. This is common infrastructure, not real-time collaborative session editing, and it does not grant permission to share a subscription.
+
+**For solo developers.** Claude and persistent jobs run on infrastructure you control. In local mode, project files, commands, builds, hooks, and supported MCP servers stay on your workstation. Reconnectable sessions and server jobs carry work across disconnections and devices.
 
 ## Two operating modes
 
