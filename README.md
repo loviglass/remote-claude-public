@@ -80,7 +80,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for transport, caching, filesys
 - Uses the project's `.remote-claude/Dockerfile`, or a default Ubuntu 24.04 image with Git, Go, Node.js, Python and build tools.
 - Runs containers with the developer's UID/GID, dropped capabilities, `no-new-privileges`, a PID limit and no Docker socket.
 - Supports up to two tmux jobs per account and eight subagents in a server job.
-- Provides optional systemd CPU, memory, I/O and task budgets for local and server workloads.
+- Provides optional systemd CPU, memory and task limits for local and server workloads, plus relative I/O weighting for the server pool.
 - Detects an already running job for the same repository under another account on a best-effort basis; `--force-new` deliberately bypasses that check.
 - Pre-approves a small set of Git/PR commands and rejects common force-push/merge spellings through Claude permissions. **Real merge protection requires Git-host branch protection and a token without merge rights.**
 
