@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the shared Claude OAuth login and copy it to managed accounts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/remote-claude/auth-sync.py
+User=root
+UMask=0077
+StateDirectory=remote-claude-auth
+StateDirectoryMode=0700
+TimeoutStartSec=90

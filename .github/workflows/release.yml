@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test Go packages
+        run: go test -race ./...
+      - name: Vet Go packages
+        run: go vet ./...
+      - name: Test Python helpers
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Scan Git history for credentials
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" \
+            zricethezav/gitleaks:v8.30.0 detect --source=/repo \
+            --log-opts=--all --redact --exit-code=1
+      - name: Build tagged source
+        run: python3 scripts/build-release.py --require-tag "$GITHUB_REF_NAME"
+      - name: Verify provenance and archives
+        run: |
+          python3 scripts/check-release.py
+          cd dist
+          sha256sum -c SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --verify-tag --title "Remote Claude ${GITHUB_REF_NAME#v}" \
+            --generate-notes
