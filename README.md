@@ -16,6 +16,12 @@ The same Go executable provides the workstation client, the server, the temporar
 - **Work that survives disconnection.** Interactive sessions reconnect after transport failures. Server mode keeps the task in tmux and can continue after the workstation is switched off.
 - **Auditable releases.** Release archives are built by CI from an exact version tag. The source commit is embedded in each executable and recorded in the update manifest; archive contents and SHA-256 hashes are checked before publication.
 
+### Operational consistency for teams
+
+Where the organization's Claude terms and subscription permit this deployment, keeping Claude Code on a single administrator-managed host with a controlled egress path gives the team one consistent managed environment and network route instead of frequent ad-hoc workstation and network changes. It can reduce manual sign-in and refresh churn and make access administration easier to audit.
+
+This reduces operational variability only. It does not prevent provider enforcement, authorize account sharing, remove human oversight, or override subscription or device rules.
+
 ## Two operating modes
 
 | Mode | Claude and conversation | Project files | Commands and builds | Works with workstation off |
