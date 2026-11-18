@@ -29,6 +29,12 @@ All notable changes are documented here. Release binaries are immutable and tied
 - Files created through the live view honour the umask instead of always being 0600.
 - `x/../.mcp.json`-style paths can no longer bypass configuration projection.
 - Commands no longer inherit the client supervisor's private environment, so a client started by a command does not act as the session's worker.
+- Idle agent worktrees left locked by a killed Claude agent are pruned too; other locks are still honoured.
+
+### Upgrading
+
+- Sessions started by an earlier release keep working while the server binary is replaced: new command adapters fall back to the earlier executor protocol, and a project open in such a session is not taken over until that session ends.
+- Clients update themselves from the server manifest at their next connection.
 
 ## 0.2.0 — public self-hosted release
 

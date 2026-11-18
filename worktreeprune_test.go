@@ -53,22 +53,33 @@ func TestPruneIdleWorktrees(t *testing.T) {
 	os.WriteFile(filepath.Join(untracked, "new.txt"), []byte("n"), 0o644)
 	locked := add(trees, "locked")
 	git(root, "worktree", "lock", "--reason", "busy", locked)
+	agentLock := "claude agent x (pid 1 start 2)"
+	stale := add(trees, "stale")
+	git(root, "worktree", "lock", "--reason", agentLock, stale)
+	running := add(trees, "running")
+	git(root, "worktree", "lock", "--reason", agentLock, running)
+	agentDirty := add(trees, "agent-dirty")
+	os.WriteFile(filepath.Join(agentDirty, "a.txt"), []byte("changed"), 0o644)
+	git(root, "worktree", "lock", "--reason", agentLock, agentDirty)
 	outside := add(filepath.Join(root, "other"), "outside")
-	for _, p := range []string{committed, dirty, untracked, locked, outside} {
+	for _, p := range []string{committed, dirty, untracked, locked, stale, agentDirty, outside} {
 		age(p, 48*time.Hour)
 	}
 	age(fresh, time.Hour)
+	age(running, time.Hour)
 
-	if n := pruneIdleWorktrees(filepath.Join(root, ".claude"), worktreeIdleLimit); n != 1 {
-		t.Fatalf("removed %d worktrees, want 1", n)
+	if n := pruneIdleWorktrees(filepath.Join(root, ".claude"), worktreeIdleLimit); n != 2 {
+		t.Fatalf("removed %d worktrees, want 2", n)
 	}
-	if _, e := os.Stat(committed); !os.IsNotExist(e) {
-		t.Errorf("clean idle worktree was kept: %v", e)
+	for _, p := range []string{committed, stale} {
+		if _, e := os.Stat(p); !os.IsNotExist(e) {
+			t.Errorf("clean idle worktree %s was kept: %v", filepath.Base(p), e)
+		}
 	}
 	if git(root, "log", "-1", "--format=%s", "committed") != "work" {
 		t.Error("branch of the removed worktree lost its commit")
 	}
-	for _, p := range []string{fresh, dirty, untracked, locked, outside} {
+	for _, p := range []string{fresh, dirty, untracked, locked, running, agentDirty, outside} {
 		if _, e := os.Stat(p); e != nil {
 			t.Errorf("%s was removed", filepath.Base(p))
 		}
@@ -79,8 +90,8 @@ func TestPruneIdleWorktrees(t *testing.T) {
 }
 
 func TestParseWorktreeList(t *testing.T) {
-	a := parseWorktreeList([]byte("worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /r/.claude/worktrees/x\nHEAD 2\ndetached\nlocked\n\nworktree /r/.claude/worktrees/y\nHEAD 3\nlocked agent running\n\nworktree /r/.claude/worktrees/z\nHEAD 4\nprunable gitdir file points to non-existent location\n"))
-	want := []listedWorktree{{filepath.FromSlash("/r"), false}, {filepath.FromSlash("/r/.claude/worktrees/x"), true}, {filepath.FromSlash("/r/.claude/worktrees/y"), true}, {filepath.FromSlash("/r/.claude/worktrees/z"), false}}
+	a := parseWorktreeList([]byte("worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /r/.claude/worktrees/x\nHEAD 2\ndetached\nlocked\n\nworktree /r/.claude/worktrees/y\nHEAD 3\nlocked agent running\n\nworktree /r/.claude/worktrees/z\nHEAD 4\nprunable gitdir file points to non-existent location\n\nworktree /r/.claude/worktrees/w\nHEAD 5\nlocked claude agent w (pid 1 start 2)\n"))
+	want := []listedWorktree{{path: filepath.FromSlash("/r")}, {path: filepath.FromSlash("/r/.claude/worktrees/x"), locked: true}, {path: filepath.FromSlash("/r/.claude/worktrees/y"), locked: true}, {path: filepath.FromSlash("/r/.claude/worktrees/z")}, {path: filepath.FromSlash("/r/.claude/worktrees/w"), agentLocked: true}}
 	if len(a) != len(want) {
 		t.Fatalf("got %v", a)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -217,6 +218,12 @@ func bridgeExecClientContext(ctx context.Context, client *ssh.Client, r ExecRequ
 	}
 	// The request travels with the channel open: one round trip, then output.
 	ch, requests, e := client.OpenChannel(execChannelType, []byte(encode(r)))
+	var open *ssh.OpenChannelError
+	if errors.As(e, &open) && open.Reason == ssh.UnknownChannelType {
+		// A session of an earlier release keeps its executor while the
+		// server binary is upgraded underneath it.
+		ch, requests, e = legacyExec(client, r)
+	}
 	if e != nil {
 		return ExecResult{}, fmt.Errorf("executor rejected request: %w", e)
 	}
@@ -260,6 +267,19 @@ func bridgeExecClientContext(ctx context.Context, client *ssh.Client, r ExecRequ
 }
 
 const execChannelType = "rc-exec"
+
+func legacyExec(client *ssh.Client, r ExecRequest) (ssh.Channel, <-chan *ssh.Request, error) {
+	ch, requests, e := client.OpenChannel("session", nil)
+	if e != nil {
+		return nil, nil, e
+	}
+	payload := ssh.Marshal(struct{ Command string }{encode(r)})
+	if ok, e := ch.SendRequest("exec", true, payload); e != nil || !ok {
+		ch.Close()
+		return nil, nil, fmt.Errorf("executor rejected request: %v", e)
+	}
+	return ch, requests, nil
+}
 
 func copyConnections(a, b net.Conn) {
 	var w sync.WaitGroup
