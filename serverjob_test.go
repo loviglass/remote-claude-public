@@ -38,7 +38,7 @@ func TestResumeCheckoutPreservesJobBranchAndUncommittedWork(t *testing.T) {
 	if e := os.WriteFile(file, []byte("unfinished\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
-	if e := prepareCheckout(dir, origin, strings.Repeat("0", 40), "main", "Developer", "developer@example.com", true); e != nil {
+	if e := prepareCheckout(dir, origin, strings.Repeat("0", 40), "main", "Developer", "developer@example.com", "", true); e != nil {
 		t.Fatal(e)
 	}
 	if got := run("branch", "--show-current"); got != "claude/main-20261013-080931" {
@@ -54,7 +54,7 @@ func TestResumeCheckoutPreservesJobBranchAndUncommittedWork(t *testing.T) {
 
 func TestResumeCheckoutRequiresEarlierJob(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
-	if e := prepareCheckout(dir, "https://example.com/team/project.git", strings.Repeat("0", 40), "main", "", "", true); e == nil || !strings.Contains(e.Error(), "no earlier server job") {
+	if e := prepareCheckout(dir, "https://example.com/team/project.git", strings.Repeat("0", 40), "main", "", "", "", true); e == nil || !strings.Contains(e.Error(), "no earlier server job") {
 		t.Fatalf("missing job: %v", e)
 	}
 	if _, e := os.Stat(dir); !os.IsNotExist(e) {
@@ -115,5 +115,143 @@ func TestJobBranchNeverReusesTheSourceBranch(t *testing.T) {
 		if got := jobBranch(base, now); got != want {
 			t.Errorf("jobBranch(%q) = %q, want %q", base, got, want)
 		}
+	}
+}
+
+func TestServerJobStartsFromWorkingTree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	base := t.TempDir()
+	t.Setenv("HOME", base)
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, b)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	origin := filepath.Join(base, "origin.git")
+	git(base, "init", "-q", "--bare", "-b", "main", origin)
+	pc := filepath.Join(base, "pc")
+	git(base, "clone", "-q", origin, pc)
+	git(pc, "config", "user.name", "Developer")
+	git(pc, "config", "user.email", "developer@example.com")
+	writeTree(t, pc, map[string]string{"pushed.txt": "pushed\n", "gone.txt": "to delete\n", ".gitignore": "*.secret\n"})
+	git(pc, "add", ".")
+	git(pc, "commit", "-qm", "pushed")
+	git(pc, "push", "-q", "origin", "main")
+	writeTree(t, pc, map[string]string{"local.txt": "unpushed commit\n"})
+	git(pc, "add", "local.txt")
+	git(pc, "commit", "-qm", "unpushed")
+	writeTree(t, pc, map[string]string{"pushed.txt": "edited, not committed\n", "new.txt": "untracked\n", "key.secret": "ignored\n"})
+	os.Remove(filepath.Join(pc, "gone.txt"))
+	head := git(pc, "rev-parse", "HEAD")
+	statusBefore := git(pc, "status", "--porcelain")
+
+	bundle, snapshot, err := workingTreeBundle(pc, head, false)
+	if err != nil || bundle == nil || snapshot == head {
+		t.Fatalf("snapshot: %v (bundle %d bytes, %s)", err, len(bundle), snapshot)
+	}
+	if got := git(pc, "status", "--porcelain"); got != statusBefore {
+		t.Fatalf("snapshot changed the workstation: %q", got)
+	}
+	if refs := git(pc, "for-each-ref", "refs/remote-claude"); refs != "" {
+		t.Fatalf("temporary ref left behind: %s", refs)
+	}
+	p := uploadedSnapshot(snapshot)
+	os.MkdirAll(filepath.Dir(p), 0700)
+	if err := os.WriteFile(p, bundle, 0600); err != nil {
+		t.Fatal(err)
+	}
+	job := filepath.Join(base, "server-jobs", "job")
+	if err := prepareCheckout(job, origin, head, "main", "Developer", "developer@example.com", snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(job, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("job branch starts at %s, want the unpushed HEAD %s", got, head)
+	}
+	if got := readFile(t, filepath.Join(job, "pushed.txt")); got != "edited, not committed\n" {
+		t.Fatalf("uncommitted edit: %q", got)
+	}
+	if got := readFile(t, filepath.Join(job, "new.txt")); got != "untracked\n" {
+		t.Fatalf("untracked file: %q", got)
+	}
+	assertMissing(t, filepath.Join(job, "gone.txt"))
+	assertMissing(t, filepath.Join(job, "key.secret"))
+	status := git(job, "status", "--porcelain")
+	for _, want := range []string{"M pushed.txt", "D gone.txt", "?? new.txt"} {
+		if !strings.Contains(status, want) {
+			t.Fatalf("job status %q lacks %q", status, want)
+		}
+	}
+	assertMissing(t, p)
+}
+
+func TestServerJobBundleWithStaleOriginRefsFallsBackToFull(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	base := t.TempDir()
+	t.Setenv("HOME", base)
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=d", "GIT_AUTHOR_EMAIL=d@x", "GIT_COMMITTER_NAME=d", "GIT_COMMITTER_EMAIL=d@x")
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, b)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	origin := filepath.Join(base, "origin.git")
+	git(base, "init", "-q", "--bare", "-b", "main", origin)
+	pc := filepath.Join(base, "pc")
+	// A file:// URL transfers only reachable objects, like a real remote.
+	remote := "file://" + origin
+	git(base, "clone", "-q", remote, pc)
+	writeTree(t, pc, map[string]string{"a.txt": "a\n"})
+	git(pc, "add", ".")
+	git(pc, "commit", "-qm", "base")
+	git(pc, "push", "-q", "origin", "main")
+	// A feature branch is pushed, then deleted on origin (for example after a
+	// squash merge); the workstation still has its remote-tracking ref.
+	git(pc, "switch", "-qc", "feature")
+	writeTree(t, pc, map[string]string{"b.txt": "b\n"})
+	git(pc, "add", ".")
+	git(pc, "commit", "-qm", "feature")
+	git(pc, "push", "-q", "origin", "feature")
+	git(origin, "branch", "-D", "feature")
+	writeTree(t, pc, map[string]string{"c.txt": "work in progress\n"})
+	head := git(pc, "rev-parse", "HEAD")
+
+	dir := filepath.Join(base, "server-jobs", jobCheckout(remote))
+	thin, _, err := workingTreeBundle(pc, head, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinFile := filepath.Join(base, "thin.bundle")
+	os.WriteFile(thinFile, thin, 0600)
+	if bundleUsable(dir, remote, thinFile) {
+		t.Fatal("a bundle needing a commit origin no longer has was accepted")
+	}
+	full, snapshot, err := workingTreeBundle(pc, head, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullFile := uploadedSnapshot(snapshot)
+	os.MkdirAll(filepath.Dir(fullFile), 0700)
+	os.WriteFile(fullFile, full, 0600)
+	if !bundleUsable(dir, remote, fullFile) {
+		t.Fatal("full bundle rejected")
+	}
+	if err := prepareCheckout(dir, remote, head, "feature", "d", "d@x", snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, "c.txt")); got != "work in progress\n" {
+		t.Fatalf("work in progress: %q", got)
 	}
 }

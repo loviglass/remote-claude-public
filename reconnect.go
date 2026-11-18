@@ -61,12 +61,20 @@ func sessionAttemptEnv(marker string, attempt int, server bool) []string {
 		ordinaryContinueEnv+"="+continueOrdinary)
 }
 
+// A session that ran this long was healthy; its drop starts a fresh backoff.
+const healthySession = 30 * time.Second
+
 func retryInteractiveSession(marker *os.File, run func(attempt int) error, wait func(time.Duration), server bool) error {
+	failures := 0
 	for attempt := 0; ; attempt++ {
 		if err := marker.Truncate(0); err != nil {
 			return err
 		}
+		started := time.Now()
 		err := run(attempt)
+		if time.Since(started) >= healthySession {
+			failures = 0
+		}
 		status, readErr := os.ReadFile(marker.Name())
 		if readErr != nil {
 			return readErr
@@ -80,11 +88,12 @@ func retryInteractiveSession(marker *os.File, run func(attempt int) error, wait 
 		}
 		// Back off while offline, but keep trying until Ctrl+C. Server
 		// reattaches never start a new job or rebuild its container.
-		delay := serverRetryDelay(attempt)
+		delay := serverRetryDelay(failures)
+		failures++
 		if server {
 			fmt.Fprintf(os.Stderr, "\nSSH connection lost; reattaching to the same server job in %s (Ctrl+C to stop).\n", delay)
 		} else {
-			fmt.Fprintf(os.Stderr, "\nSSH connection lost; resuming the conversation in %s (Ctrl+C to stop).\n", delay)
+			fmt.Fprintf(os.Stderr, "\nSSH connection lost; reattaching to the running Claude session in %s (Ctrl+C to stop).\n", delay)
 		}
 		wait(delay)
 	}

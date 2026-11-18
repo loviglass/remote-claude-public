@@ -76,9 +76,10 @@ func bridgeShell(args []string) error {
 	if e != nil {
 		return e
 	}
-	if cwdFile != "" && result.Code == 0 {
+	// Like a local shell, a failing command keeps the directory it changed to.
+	if cwdFile != "" && result.Cwd != "" {
 		if e = writeRemoteCwd(c, cwdFile, result.Cwd); e != nil {
-			return e
+			fmt.Fprintln(os.Stderr, "remote-claude:", e)
 		}
 	}
 	if result.Code != 0 {

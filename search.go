@@ -217,7 +217,16 @@ func bridgeSearch(args []string) error {
 	}
 	var paths []string
 	mapped, supported := prepareSearch(args, cwd, c.RemoteRoot, &paths)
-	if !c.LocalSearch || !supported || (len(args) == 1 && (args[0] == "--version" || args[0] == "--help")) {
+	// The replica holds every file Git does not ignore, so ordinary searches
+	// run on the server without a network round trip. Searches that include
+	// ignored files or follow symlinks need the workstation's full tree.
+	inReplica := c.Replica && (cwd == c.RemoteRoot || strings.HasPrefix(cwd, c.RemoteRoot+"/")) && !searchNeedsWorkstation(args)
+	if inReplica || !c.LocalSearch || !supported || (len(args) == 1 && (args[0] == "--version" || args[0] == "--help")) {
+		if c.Replica && !inReplica && !c.LocalSearch {
+			// Without workstation ripgrep, ignored paths are reachable only
+			// through the replica's symlinks into the live view.
+			args = append([]string{"--follow"}, args...)
+		}
 		cmd := exec.Command(serverRipgrep, args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -236,4 +245,22 @@ func bridgeSearch(args []string) error {
 		return &exitError{r.Code}
 	}
 	return nil
+}
+
+func searchNeedsWorkstation(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		switch {
+		case a == "--follow" || strings.HasPrefix(a, "--no-ignore") || a == "--unrestricted":
+			return true
+		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsAny(a[1:], "uL"):
+			// Short option clusters: -u, -uu, -L. Values of options such as
+			// -e or -g may contain these letters too; erring towards the
+			// workstation is always correct.
+			return true
+		}
+	}
+	return false
 }

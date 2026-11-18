@@ -135,7 +135,8 @@ func (f *projectFS) openWrite(r *sftp.Request) (sftp.WriterAtReaderAt, error) {
 	if a.Excl {
 		flags |= os.O_EXCL
 	}
-	return f.root.OpenFile(p, flags, 0600)
+	// The umask applies, as for any program creating a file.
+	return f.root.OpenFile(p, flags, 0666)
 }
 func (f *projectFS) Filewrite(r *sftp.Request) (io.WriterAt, error)          { return f.openWrite(r) }
 func (f *projectFS) OpenFile(r *sftp.Request) (sftp.WriterAtReaderAt, error) { return f.openWrite(r) }
@@ -253,7 +254,7 @@ func (f *projectFS) Filecmd(r *sftp.Request) error {
 	case "Remove", "Rmdir":
 		return f.root.Remove(p)
 	case "Mkdir":
-		return f.root.Mkdir(p, 0755)
+		return f.root.Mkdir(p, 0777)
 	case "Symlink":
 		return f.root.Symlink(r.Filepath, q)
 	case "Link":
@@ -267,7 +268,9 @@ func (f *projectFS) Filecmd(r *sftp.Request) error {
 				return e
 			}
 			e = h.Truncate(int64(st.Size))
-			h.Close()
+			if ce := h.Close(); e == nil {
+				e = ce
+			}
 			if e != nil {
 				return e
 			}

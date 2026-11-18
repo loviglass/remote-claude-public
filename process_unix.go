@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"os/signal"
 	"syscall"
 )
 
@@ -27,4 +28,17 @@ func restartSelf() error {
 		return e
 	}
 	return syscall.Exec(path, os.Args, os.Environ())
+}
+
+func exitSignal(e *exec.ExitError) int {
+	if st, ok := e.Sys().(syscall.WaitStatus); ok && st.Signaled() {
+		return int(st.Signal())
+	}
+	return 2
+}
+
+func resizeSignals() <-chan os.Signal {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGWINCH)
+	return c
 }

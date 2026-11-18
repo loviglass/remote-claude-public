@@ -5,12 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
-	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -41,27 +38,39 @@ func serverRun(args []string) error {
 		return serverJob(args[1:])
 	case "job-list":
 		return serverJobList(args[1:])
+	case "job-upload":
+		return serverJobUpload(args[1:])
 	case "job-image":
 		return serverJobImage(args[1:])
 	case "job-container":
 		return serverJobContainer(args[1:])
 	case "job-run":
 		return serverJobRun(args[1:])
+	case "host":
+		if len(args) != 2 {
+			return fmt.Errorf("invalid project id")
+		}
+		return serverHost(args[1])
 	case "doctor":
 		if len(args) != 2 || !validName(args[1]) {
 			return fmt.Errorf("invalid session id")
 		}
 		return serverDoctor(args[1])
-	case "attach":
-		if len(args) != 2 || !validName(args[1]) {
+	case "attach", "run":
+		if len(args) < 2 || len(args) > 3 || !validName(args[1]) {
 			return fmt.Errorf("invalid session id")
 		}
-		return serverAttach(args[1])
+		encoded := ""
+		if len(args) == 3 {
+			encoded = args[2]
+		}
+		if args[0] == "run" {
+			return serverRunHost(args[1], encoded)
+		}
+		return serverAttachHost(args[1], encoded)
 	case "cleanup":
-		if len(args) != 2 || !validName(args[1]) {
-			return fmt.Errorf("invalid session id")
-		}
-		return serverCleanup(args[1])
+		// Hosts outlive connections; kept so older clients exit cleanly.
+		return nil
 	}
 	return fmt.Errorf("unknown server command")
 }
@@ -71,215 +80,30 @@ func serverPrepare() error {
 		return e
 	}
 	if c.Protocol != protocolVersion || !validName(c.ID) || c.RemoteRoot != projectDir(c.ID) {
-		return fmt.Errorf("invalid protocol or workspace")
+		return fmt.Errorf("invalid protocol or workspace; update the remote-claude client")
 	}
-	host, _, e := strings.Cut(c.Endpoint, ":")
-	if !e || host != "127.0.0.1" {
+	host, _, ok := strings.Cut(c.Endpoint, ":")
+	if !ok || host != "127.0.0.1" {
 		return fmt.Errorf("bridge must listen on server loopback")
 	}
-	session := randomID()
-	dir := filepath.Join(stateDir(), "sessions")
-	if e := os.MkdirAll(dir, 0700); e != nil {
+	paths := projectHostPaths(c.ID)
+	if e := os.MkdirAll(paths.dir, 0700); e != nil {
 		return e
 	}
-	if e := os.MkdirAll(filepath.Dir(c.RemoteRoot), 0700); e != nil {
+	c.Replica, c.LiveRoot = true, paths.live
+	if e := writeJSON(paths.bridge, c); e != nil {
 		return e
 	}
-	lock := filepath.Join(filepath.Dir(c.RemoteRoot), "active")
-	// A dropped workstation cannot resume an in-flight command. Reclaim only a
-	// workspace whose previous authenticated bridge is no longer reachable.
-	if old, e := os.ReadFile(lock); e == nil && validName(string(old)) {
-		var previous SessionConfig
-		if readJSON(filepath.Join(dir, string(old)+".json"), &previous) == nil {
-			conn, e := dialBridge(previous)
-			if e != nil {
-				serverCleanup(string(old))
-			} else {
-				conn.Close()
-			}
-		}
-	}
-	f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("project already connected; close its other session first (%s)", lock)
-	}
-	f.WriteString(session)
-	f.Close()
-	p := filepath.Join(dir, session+".json")
-	// Only the managed caching transport owns a persistent workstation SSH
-	// connection. Clients without it and strict metadata mode keep direct RPCs.
-	c.ExecSocket = ""
-	if c.ConfigSnapshot && !c.FreshMetadata {
-		c.ExecSocket = filepath.Join(dir, session+".ssh")
-	}
-	if e := writeJSON(p, c); e != nil {
-		os.Remove(lock)
+	if e := ensureHost(c.ID); e != nil {
 		return e
 	}
-	ok := false
-	defer func() {
-		if !ok {
-			serverCleanup(session)
-		}
-	}()
-	versionReady := make(chan struct{})
-	var versionError error
-	go func() {
-		versionError = verifyClaudeVersion(claudeBinary, filepath.Join(stateDir(), "claude-version.json"))
-		close(versionReady)
-	}()
-	defer func() { <-versionReady }()
-	// Reclaim a disconnected mount before touching it. Even stat/MkdirAll on
-	// a dead FUSE mount can fail with EIO, preventing a normal reconnect.
-	if e := os.MkdirAll(c.RemoteRoot, 0700); e != nil {
-		return e
-	}
-	// Cache only metadata briefly. Cache kernel path lookups too: without it,
-	// stat(a/b/c) makes a network round trip for each ancestor. SSHFS rounds its
-	// cache clock to seconds, so use a zero stat/link TTL plus a one-second
-	// kernel TTL; directory listings have a one-second SSHFS TTL. Content reads
-	// remain uncached. The combined metadata age is approximately two seconds.
-	cache := "dir_cache=yes,dcache_timeout=1,dcache_stat_timeout=0,dcache_link_timeout=0,attr_timeout=1,entry_timeout=1"
-	if c.FreshMetadata {
-		cache = "dir_cache=no,attr_timeout=0,entry_timeout=0"
-	}
-	cmd := exec.Command("sshfs", "bridge:/", c.RemoteRoot, "-o", "ssh_command="+serverBinary+" sftp,"+cache+",direct_io,negative_timeout=0,uid="+fmt.Sprint(os.Getuid())+",gid="+fmt.Sprint(os.Getgid()))
-	cmd.Env = append(os.Environ(), "REMOTE_CLAUDE_SESSION="+p)
-	if b, e := cmd.CombinedOutput(); e != nil {
-		return fmt.Errorf("mount project: %v: %s", e, b)
-	}
-	if _, e := os.Stat(c.RemoteRoot); e != nil {
-		return e
-	}
-	<-versionReady
-	if versionError != nil {
-		return versionError
-	}
-	ok = true
-	return json.NewEncoder(os.Stdout).Encode(map[string]string{"session": session})
-}
-func serverAttach(id string) error {
-	path := filepath.Join(stateDir(), "sessions", id+".json")
-	var c SessionConfig
-	if e := readJSON(path, &c); e != nil {
-		return e
-	}
-	defer serverCleanup(id)
-	if e := verifyClaudeVersion(claudeBinary, filepath.Join(stateDir(), "claude-version.json")); e != nil {
-		return e
-	}
-	args := []string{"--setting-sources", "project,local", "--append-system-prompt", fmt.Sprintf("This session uses remote-claude. Claude runs on Linux, but project commands execute on the developer's %s computer. Local project path: %s. File tools use the mounted project at %s. Use project-relative paths in commands whenever possible. Do not install project dependencies on the VPS. The bridge executes project hooks and stdio MCP servers on the developer computer. Server home configuration is not the developer's personal configuration.", c.OS, c.LocalRoot, c.RemoteRoot)}
-	args = append(args, c.Args...)
-	cmd := exec.Command(claudeBinary, args...)
-	cmd.Dir = c.RemoteRoot
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	// The blanket nonessential-traffic switch also blocks the interactive
-	// /usage request in the pinned Claude version. Disable only background
-	// updates and reporting so /usage can fetch account limits.
-	cmd.Env = append(os.Environ(), "REMOTE_CLAUDE_SESSION="+path, "DISABLE_AUTOUPDATER=1", "DISABLE_TELEMETRY=1", "DISABLE_ERROR_REPORTING=1")
-	cmd.Env = append(cmd.Env, "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3", "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1")
-	// The Bash edit diff puts an inotify watch on every project directory from
-	// Claude's main thread. On the mount each watch is a synchronous round trip
-	// to the workstation, so large trees (node_modules, worktrees) freeze the
-	// session for minutes, and commands run on the workstation where VPS
-	// inotify never sees their writes anyway.
-	cmd.Env = append(cmd.Env, "CLAUDE_CODE_BASH_EDIT_DIFF=0")
-	if c.LocalSearch {
-		if _, err := os.Stat(serverRipgrep); err == nil {
-			cmd.Env = append(cmd.Env, "USE_BUILTIN_RIPGREP=0")
-		}
-	}
-	gitDir, e := gitShimDir()
+	rep, e := hostCall(c.ID, hostRequest{Op: "bind"})
 	if e != nil {
 		return e
 	}
-	cmd.Env = append(cmd.Env, "CLAUDE_CODE_SHELL_PREFIX="+filepath.Join(gitDir, "shell"))
-	commandPath := gitDir + ":" + os.Getenv("PATH")
-	if !c.ConfigSnapshot || c.FreshMetadata {
-		// Ripgrep's discovery deadline can silently omit configuration files on
-		// an uncached network mount. The slower Node walker is complete.
-		cmd.Env = append(cmd.Env, "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH=1")
-	}
-	if c.OS == "windows" || c.Shell == "powershell" {
-		cmd.Env = append(cmd.Env, "CLAUDE_CODE_USE_POWERSHELL_TOOL=1")
-		commandPath = "/opt/remote-claude/windows:" + commandPath
-	}
-	cmd.Env = append(cmd.Env, "PATH="+commandPath)
-	stopScope, e := constrainClaude(cmd, id)
-	if e != nil {
-		return e
-	}
-	defer stopScope()
-	if e = cmd.Start(); e != nil {
-		return e
-	}
-	finished := make(chan error, 1)
-	go func() { finished <- cmd.Wait() }()
-	var bridgeLost atomic.Bool
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				conn, e := dialBridge(c)
-				if e != nil {
-					bridgeLost.Store(true)
-					cmd.Process.Kill()
-					// A newer session may already have mounted the same path.
-					if owner, _ := os.ReadFile(filepath.Join(filepath.Dir(c.RemoteRoot), "active")); string(owner) == id {
-						abortProjectMount(c.RemoteRoot)
-					}
-					return
-				}
-				conn.Close()
-			}
-		}
-	}()
-	e = <-finished
-	if bridgeLost.Load() {
-		return &exitError{bridgeLostExitCode}
-	}
-	if e != nil {
-		if x, ok := e.(*exec.ExitError); ok {
-			return &exitError{x.ExitCode()}
-		}
-		return e
-	}
-	return nil
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"session": c.ID, "running": rep.Running})
 }
-func serverCleanup(id string) error {
-	p := filepath.Join(stateDir(), "sessions", id+".json")
-	var c SessionConfig
-	if e := readJSON(p, &c); e != nil {
-		if os.IsNotExist(e) {
-			return nil
-		}
-		return e
-	}
-	if !validName(c.ID) || c.RemoteRoot != projectDir(c.ID) {
-		return fmt.Errorf("invalid workspace in cleanup")
-	}
-	lock := filepath.Join(filepath.Dir(c.RemoteRoot), "active")
-	owner, _ := os.ReadFile(lock)
-	if string(owner) != id {
-		return fmt.Errorf("workspace belongs to another session")
-	}
-	abortProjectMount(c.RemoteRoot)
-	exec.Command("fusermount3", "-uz", c.RemoteRoot).Run()
-	if c.ExecSocket == filepath.Join(stateDir(), "sessions", id+".ssh") {
-		os.Remove(c.ExecSocket)
-		os.Remove(c.ExecSocket + ".pub")
-	}
-	os.Remove(lock)
-	return os.Remove(p)
-}
+
 func enrollServer() error {
 	b, e := io.ReadAll(io.LimitReader(os.Stdin, 16384))
 	if e != nil {

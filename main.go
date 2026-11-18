@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 )
 
-const version = "0.2.0"
-const protocolVersion = 1
+const version = "0.3.0"
+const protocolVersion = 2
 
 // Release builds replace this with the full source commit using -ldflags -X.
 var buildCommit = "unknown"

@@ -34,63 +34,64 @@ This reduces operational variability only. It does not prevent provider enforcem
 
 | Mode | Claude and conversation | Project files | Commands and builds | Works with workstation off |
 |---|---|---|---|---|
-| Local bridge (default) | Server | Workstation, mounted through SSHFS | Workstation | No |
-| Server mode (`--server`) | Server, in tmux/Docker | Server clone fetched from `origin` | Server container | Yes |
-| Existing server checkout (`night`) | Server, in tmux/Docker | Existing server checkout | Server container | Yes |
+| Local bridge (default) | Server, in a persistent session host | Workstation; Claude edits a server replica synchronised both ways | Workstation | Claude keeps its session; commands wait for the reconnect |
+| Server mode (`--server`) | Server, in tmux | Server clone of `origin` plus the workstation's exact working tree | Server account (a container only with `.remote-claude/Dockerfile`) | Yes |
+| Existing server checkout (`night`) | Server, in tmux | Existing server checkout | Server account | Yes |
 
-Local mode is intended for interactive development in a working tree. Server mode starts from a **committed and pushed** commit; uncommitted and unpushed changes are never transferred. `night` reuses an existing Git checkout on the server and does not prepare a new branch.
+Local mode is intended for interactive development in a working tree. Server mode starts from the workstation's current state, including unpushed commits and uncommitted changes, and runs autonomously. `night` reuses an existing Git checkout on the server and does not prepare a new branch.
 
 ## Local bridge architecture
 
 ```mermaid
 flowchart LR
     U[Developer terminal] --> C[remote-claude client]
-    C <-->|Pinned SSH, separate terminal/data connections| S[Managed account on Linux server]
-    S --> A[Pinned Claude Code]
-    A <-->|SSHFS over reverse SSH| F[Workstation project files]
+    C <-->|Pinned SSH, separate terminal/data connections| H[Session host on the server]
+    H --> A[Pinned Claude Code in a persistent PTY]
+    A <-->|local disk| R[Project replica]
+    R <-->|two-way sync with command barriers| C
     A --> P[Shell / Git / hook / MCP adapters]
-    P <-->|Authenticated bridge channels| C
+    P <-->|one round trip per command| C
     C --> B[Local Bash or PowerShell, Git, builds, tests, hooks, MCP]
 ```
 
-The terminal and data connections are established in parallel. The data connection carries a reverse-forwarded, per-session SSH/SFTP bridge. A private Unix-socket executor reuses that authenticated connection for Git, shell, hooks and MCP dispatch instead of performing a new handshake for every command.
+Claude's file tools work on a replica of the project on the server's local disk, so reads, edits, directory walks and searches cost no network round trip. The replica holds everything Git does not ignore; ignored paths (dependencies, build output, local secrets), `.git` and files over 16 MiB stay on the workstation and appear in the replica as symlinks into a live SSHFS view.
+
+Every change travels in an ordered stream in each direction. Before a command runs on the workstation, the server sends Claude's pending edits and the workstation waits for them; after the command, the workstation sends what the command changed and the server applies it before Claude sees the result. Both barriers ride on the command's own round trip. When both sides change the same file before it is synchronised, the workstation version wins; Claude's version is kept on the server and Claude is told where.
+
+A per-project session host on the server owns the replica, the command executor and Claude's terminal. It outlives SSH connections: after a network drop the client reconnects and reattaches to the same Claude process, which kept its turn and context.
 
 The workstation listener is bound to `127.0.0.1` with an ephemeral port. Each session has a random secret and an ephemeral bridge host key. The server's SSH host key is pinned by the SHA-256 fingerprint from the invitation; only Ed25519 server host keys are accepted.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for transport, caching, filesystem, configuration projection and reconnect details.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for synchronisation, transport, configuration projection and reconnect details.
 
 ## Features
 
 ### Workstation integration
 
-- Native `CLAUDE.md`, nested instructions, `.claude/rules`, skills, commands, agents and project/local settings are visible in the mounted repository.
+- Native `CLAUDE.md`, nested instructions, `.claude/rules`, skills, commands, agents and project/local settings are part of the replica.
 - Command and HTTP hooks execute on the workstation, including exec-form hooks and `CLAUDE_ENV_FILE` propagation.
 - stdio MCP servers run locally. HTTP/SSE MCP connections and HTTP hooks originate from the workstation, including access to its localhost and VPN.
 - Bash and PowerShell adapters preserve stdout, stderr, exit status and working-directory changes. Commands receive the workstation environment plus project `env` settings.
-- The project filesystem is rooted at the selected directory. Read, write, rename, mkdir, remove, symlink, link and metadata operations are supported through SFTP.
-- Small files are read in one request; ordinary file contents are not cached between opens. Short metadata/configuration caches and workstation ripgrep reduce high-latency round trips.
-- `--fresh-metadata` disables the short caches and selects the slower native configuration discovery path.
-- `--check` exercises SSH, file operations, local command execution and local-edit visibility without calling the model.
+- Edits by Claude reach the workstation within a round trip, so an editor or file watcher there sees them at once; workstation edits reach Claude the same way.
+- Searches run on the replica; searches that include ignored files run on the workstation with ripgrep.
+- `--check` exercises the replica, both synchronisation barriers and local command execution without calling the model.
 
 ### Reliability
 
-- Interactive local sessions reconnect and continue the selected conversation after an SSH drop.
-- Server sessions reattach to the existing tmux task without creating another branch or rebuilding the container.
-- Retry delays increase from 1 to 16 seconds. `Ctrl+C` stops reconnect attempts.
+- Claude runs in a persistent session host. After an SSH drop the client reconnects and reattaches to the same process; nothing restarts.
+- While the workstation is away Claude keeps working on the replica; its commands wait up to a minute for the reconnect. Edits made meanwhile on either side are reconciled on reconnect.
+- Server sessions reattach to the existing tmux task without creating another branch.
+- Retry delays increase from 1 to 16 seconds and start again after a healthy session. `Ctrl+C` stops reconnect attempts.
 - Non-interactive `--print` requests are **not** automatically repeated.
 - A command interrupted by a transport failure is not blindly replayed: it may already have run, so its result must be checked.
-- The server watchdog terminates a Claude process whose workstation bridge has disappeared and can abort a stale FUSE mount.
 
 ### Server mode
 
-- Clones/fetches `origin`, verifies that the workstation's current commit exists there and creates a `claude/<branch>-<timestamp>` branch.
-- Keeps tasks in per-user tmux sessions and existing checkouts under `~/server-jobs/`.
-- Uses the project's `.remote-claude/Dockerfile`, or a default Ubuntu 24.04 image with Git, Go, Node.js, Python and build tools.
-- Runs containers with the developer's UID/GID, dropped capabilities, `no-new-privileges`, a PID limit and no Docker socket.
-- Supports up to two tmux jobs per account and eight subagents in a server job.
+- Starts from the workstation's working tree: unpushed commits and uncommitted (including untracked, not ignored) files are transferred as a Git bundle, without touching the developer's index or branches. They appear as uncommitted changes on a new `claude/<branch>-<timestamp>` branch.
+- Runs under the developer's server account, like an SSH login: the job can build, test, start services and inspect the server, its logs and databases. A project that wants an isolated toolchain provides `.remote-claude/Dockerfile`.
+- Runs autonomously: every tool is allowed for the account's rights, while deny rules (which win in every permission mode) block PR merges, force pushes and remote branch deletion. **Real merge protection requires Git-host branch protection and a token without merge rights.**
+- Keeps tasks in per-user tmux sessions and checkouts under `~/server-jobs/`; up to two jobs per account and eight subagents per job.
 - Provides optional systemd CPU, memory and task limits for local and server workloads, plus relative I/O weighting for the server pool.
-- Detects an already running job for the same repository under another account on a best-effort basis; `--force-new` deliberately bypasses that check.
-- Pre-approves a small set of Git/PR commands and rejects common force-push/merge spellings through Claude permissions. **Real merge protection requires Git-host branch protection and a token without merge rights.**
 
 ## Client quick start
 

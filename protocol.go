@@ -42,6 +42,10 @@ type SessionConfig struct {
 	ExecSocket     string   `json:"exec_socket,omitempty"`
 	LocalSearch    bool     `json:"local_search,omitempty"`
 	BulkRead       bool     `json:"bulk_read,omitempty"`
+	// Replica: file tools use a synchronised copy at RemoteRoot; Git-ignored
+	// paths are symlinks into the live view at LiveRoot.
+	Replica  bool   `json:"replica,omitempty"`
+	LiveRoot string `json:"live_root,omitempty"`
 }
 type ExecRequest struct {
 	Kind    string            `json:"kind"`
@@ -51,11 +55,19 @@ type ExecRequest struct {
 	Env     map[string]string `json:"env,omitempty"`
 	Spec    map[string]any    `json:"spec,omitempty"`
 	ID      string            `json:"id"`
+	// SyncSeq: replica changes up to this sequence must be on the
+	// workstation before the command starts. SyncAfter asks the workstation
+	// to report the command's file changes in ExecResult.SyncSeq.
+	SyncSeq   uint64 `json:"sync_seq,omitempty"`
+	SyncEpoch string `json:"sync_epoch,omitempty"`
+	SyncAfter bool   `json:"sync_after,omitempty"`
 }
 type ExecResult struct {
-	Cwd   string `json:"cwd,omitempty"`
-	Code  int    `json:"code"`
-	Error string `json:"error,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	Code      int    `json:"code"`
+	Error     string `json:"error,omitempty"`
+	SyncSeq   uint64 `json:"sync_seq,omitempty"`
+	SyncEpoch string `json:"sync_epoch,omitempty"`
 }
 
 func randomID() string {
@@ -200,20 +212,17 @@ func bridgeExecClientContext(ctx context.Context, client *ssh.Client, r ExecRequ
 	if e := ctx.Err(); e != nil {
 		return ExecResult{Code: 255}, e
 	}
-	ch, requests, e := client.OpenChannel("session", nil)
+	if r.ID == "" {
+		r.ID = randomID()
+	}
+	// The request travels with the channel open: one round trip, then output.
+	ch, requests, e := client.OpenChannel(execChannelType, []byte(encode(r)))
 	if e != nil {
-		return ExecResult{}, e
+		return ExecResult{}, fmt.Errorf("executor rejected request: %w", e)
 	}
 	defer ch.Close()
 	stop := context.AfterFunc(ctx, func() { ch.Close() })
 	defer stop()
-	if r.ID == "" {
-		r.ID = randomID()
-	}
-	payload := ssh.Marshal(struct{ Command string }{encode(r)})
-	if ok, e := ch.SendRequest("exec", true, payload); e != nil || !ok {
-		return ExecResult{}, fmt.Errorf("executor rejected request: %v", e)
-	}
 	if in != nil {
 		go func() { io.Copy(ch, in); ch.CloseWrite() }()
 	} else {
@@ -249,6 +258,9 @@ func bridgeExecClientContext(ctx context.Context, client *ssh.Client, r ExecRequ
 	}
 	return result, nil
 }
+
+const execChannelType = "rc-exec"
+
 func copyConnections(a, b net.Conn) {
 	var w sync.WaitGroup
 	w.Add(2)
