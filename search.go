@@ -220,8 +220,19 @@ func bridgeSearch(args []string) error {
 	// The replica holds every file Git does not ignore, so ordinary searches
 	// run on the server without a network round trip. Searches that include
 	// ignored files or follow symlinks need the workstation's full tree.
-	inReplica := c.Replica && (cwd == c.RemoteRoot || strings.HasPrefix(cwd, c.RemoteRoot+"/")) && !searchNeedsWorkstation(args)
+	inReplica := c.Replica && !c.Shallow && (cwd == c.RemoteRoot || strings.HasPrefix(cwd, c.RemoteRoot+"/")) && !searchNeedsWorkstation(args)
 	if inReplica || !c.LocalSearch || !supported || (len(args) == 1 && (args[0] == "--version" || args[0] == "--help")) {
+		if supported && !(len(args) == 1 && (args[0] == "--version" || args[0] == "--help")) {
+			// Without a path ripgrep searches stdin when it is not a
+			// terminal; the mapped arguments name the directory explicitly.
+			args = mapped
+		}
+		if inReplica {
+			// Git-ignored paths are not in the replica at all, so Git's rules
+			// add nothing; reading them would go through .git in the live
+			// view and cost network round trips on every search.
+			args = append([]string{"--no-ignore-vcs", "--no-require-git"}, args...)
+		}
 		if c.Replica && !inReplica && !c.LocalSearch {
 			// Without workstation ripgrep, ignored paths are reachable only
 			// through the replica's symlinks into the live view.

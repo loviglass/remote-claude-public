@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -74,6 +75,18 @@ type treeScanner struct {
 	liveRoot string
 	// Windows has no permission bits worth propagating.
 	noModes bool
+	// shallow shows every top-level entry as a link: nothing is copied. It
+	// serves directories that are not a reasonably sized Git project.
+	shallow bool
+	// A measuring scan stops once it has seen more than these limits.
+	maxEntries int
+	maxBytes   int64
+	entries    int
+	bytes      int64
+}
+
+func (s *treeScanner) exceeded() bool {
+	return s.maxEntries > 0 && s.entries > s.maxEntries || s.maxBytes > 0 && s.bytes > s.maxBytes
 }
 
 func (s *treeScanner) scan() scanResult {
@@ -109,6 +122,14 @@ func (s *treeScanner) walk(rel, abs string, patterns []gitignore.Pattern, r *sca
 		if strings.HasPrefix(name, syncTempPrefix) {
 			continue
 		}
+		if s.shallow && rel == "" {
+			r.list = append(r.list, scanEntry{name, fileStat{Kind: kindLink}})
+			r.byPath[name] = fileStat{Kind: kindLink}
+			continue
+		}
+		if s.exceeded() {
+			return
+		}
 		p := name
 		if rel != "" {
 			p = rel + "/" + name
@@ -124,6 +145,8 @@ func (s *treeScanner) walk(rel, abs string, patterns []gitignore.Pattern, r *sca
 		}
 		r.list = append(r.list, scanEntry{p, st})
 		r.byPath[p] = st
+		s.entries++
+		s.bytes += st.Size
 		if st.Kind == kindDir {
 			s.walk(p, childAbs, patterns, r)
 		}
@@ -187,6 +210,8 @@ func (s *treeScanner) lstatEntry(p string) fileStat {
 
 type ignoreRules struct {
 	base []gitignore.Pattern
+	// git reports whether the project is inside a Git work tree.
+	git bool
 }
 
 func parseIgnore(data []byte, domain []string) []gitignore.Pattern {
@@ -228,6 +253,7 @@ func loadIgnoreRules(root string) *ignoreRules {
 		}
 		return r
 	}
+	r.git = true
 	excludes := git("config", "--path", "core.excludesFile")
 	if excludes == "" {
 		if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
@@ -296,3 +322,33 @@ func hashBytes(b []byte) contentHash {
 func hashString(s string) contentHash { return hashBytes([]byte(s)) }
 
 func noPermissionBits() bool { return runtime.GOOS == "windows" }
+
+// Limits for copying a project to the server; larger trees use the live view.
+const (
+	replicaMaxEntries = 50000
+	replicaMaxBytes   = 1 << 30
+)
+
+// replicaSuitable decides whether root is a project worth replicating: a Git
+// work tree of reasonable size that is not the home directory or a
+// filesystem root. Anything else (running Claude in ~, /, or a large or
+// unversioned directory) uses the live view, so nothing is copied and
+// personal files never land on the server's disk.
+func replicaSuitable(root string, ignores *ignoreRules) (bool, string) {
+	clean := filepath.Clean(root)
+	if home, err := os.UserHomeDir(); err == nil && clean == filepath.Clean(home) {
+		return false, "the home directory"
+	}
+	if filepath.Dir(clean) == clean {
+		return false, "a filesystem root"
+	}
+	if ignores == nil || !ignores.git {
+		return false, "not a Git project"
+	}
+	m := &treeScanner{root: root, ignores: ignores, maxEntries: replicaMaxEntries, maxBytes: replicaMaxBytes}
+	m.scan()
+	if m.exceeded() {
+		return false, fmt.Sprintf("larger than %d files or %d MiB without Git-ignored paths", replicaMaxEntries, replicaMaxBytes>>20)
+	}
+	return true, ""
+}

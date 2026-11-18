@@ -47,6 +47,9 @@ type SessionConfig struct {
 	// paths are symlinks into the live view at LiveRoot.
 	Replica  bool   `json:"replica,omitempty"`
 	LiveRoot string `json:"live_root,omitempty"`
+	// Shallow replicas hold only links to the top-level entries: the
+	// directory is not a project worth copying (see replicaSuitable).
+	Shallow bool `json:"shallow,omitempty"`
 }
 type ExecRequest struct {
 	Kind    string            `json:"kind"`

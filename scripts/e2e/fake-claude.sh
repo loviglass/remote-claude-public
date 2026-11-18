@@ -34,9 +34,9 @@ ok_before=false; [ "$seen" = "// edited by claude $$" ] && ok_before=true
 s=$(now); bash_tool "echo generated-$$ > gen.txt"; t[bash_writes_file]=$(ms $s)
 ok_after=false; [ "$(cat gen.txt 2>/dev/null)" = "generated-$$" ] && ok_after=true
 s=$(now); git status --porcelain >/dev/null; t[git_status]=$(ms $s)
-s=$(now); rg -l needle >/dev/null; t[grep]=$(ms $s)
+s=$(now); hits=$(rg -l needle | wc -l); t[grep]=$(ms $s)
 s=$(now); rg -l --no-ignore needle >/dev/null; t[grep_no_ignore]=$(ms $s)
 s=$(now); cat node_modules/pkg/index.js >/dev/null; t[read_ignored_file]=$(ms $s)
-printf '{"files_walked":%s,"command_sees_claude_edit":%s,"claude_sees_command_write":%s' "$n" "$ok_before" "$ok_after"
+printf '{"grep_hits":%s,"files_walked":%s,"command_sees_claude_edit":%s,"claude_sees_command_write":%s' "$hits" "$n" "$ok_before" "$ok_after"
 for k in "${!t[@]}"; do printf ',"%s":%s' "$k" "${t[$k]}"; done
 echo '}'

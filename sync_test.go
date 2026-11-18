@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"strconv"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -443,5 +444,67 @@ func TestSyncReplicaCannotReplaceWorkstationFileWithDirectory(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(p.repDir, "foo")); got != "workstation file" {
 		t.Fatalf("replica: %q", got)
+	}
+}
+
+func TestSyncShallowCopiesNothing(t *testing.T) {
+	p := newSyncPair(t)
+	writeTree(t, p.pcDir, map[string]string{"Downloads/big.iso": "data", ".ssh/id_ed25519": "secret", "notes.txt": "n"})
+	p.openServer()
+	root, err := os.OpenRoot(p.pcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.pcRoot = root
+	p.pc = newSyncPC(root, p.pcDir, p.repDir, &ignoreRules{}, nil)
+	p.pc.scanner.shallow = true
+	a, b := net.Pipe()
+	p.pcConn, p.srvConn = a, b
+	go p.pc.serve(a)
+	p.srv.serve(b)
+	<-p.pc.ready
+	for _, name := range []string{"Downloads", ".ssh", "notes.txt"} {
+		target, err := os.Readlink(filepath.Join(p.repDir, name))
+		if err != nil || target != filepath.Join(p.live, name) {
+			t.Fatalf("%s should be a link into the live view: %q %v", name, target, err)
+		}
+	}
+	// A file Claude creates at the top reaches the workstation and becomes a
+	// link too; nothing stays copied on the server.
+	writeTree(t, p.repDir, map[string]string{"todo.md": "from claude"})
+	p.settle()
+	if got := readFile(t, filepath.Join(p.pcDir, "todo.md")); got != "from claude" {
+		t.Fatalf("workstation: %q", got)
+	}
+	if target, err := os.Readlink(filepath.Join(p.repDir, "todo.md")); err != nil || target != filepath.Join(p.live, "todo.md") {
+		t.Fatalf("todo.md should become a link: %q %v", target, err)
+	}
+}
+
+func TestReplicaOnlyForReasonableGitProjects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if ok, _ := replicaSuitable(home, &ignoreRules{git: true}); ok {
+		t.Fatal("home directory replicated")
+	}
+	if ok, _ := replicaSuitable("/", &ignoreRules{git: true}); ok {
+		t.Fatal("filesystem root replicated")
+	}
+	plain := filepath.Join(home, "plain")
+	writeTree(t, plain, map[string]string{"a.txt": "a"})
+	if ok, _ := replicaSuitable(plain, &ignoreRules{}); ok {
+		t.Fatal("directory outside Git replicated")
+	}
+	if ok, why := replicaSuitable(plain, &ignoreRules{git: true}); !ok {
+		t.Fatalf("small Git project not replicated: %s", why)
+	}
+	big := filepath.Join(home, "big")
+	files := map[string]string{}
+	for i := 0; i <= replicaMaxEntries; i++ {
+		files[filepath.Join("d", string(rune('a'+i%26)), strconv.Itoa(i))] = ""
+	}
+	writeTree(t, big, files)
+	if ok, _ := replicaSuitable(big, &ignoreRules{git: true}); ok {
+		t.Fatal("oversized project replicated")
 	}
 }

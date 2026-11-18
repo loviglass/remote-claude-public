@@ -123,7 +123,7 @@ func (h *sessionHost) writeConfig(bridge SessionConfig) error {
 	c := SessionConfig{
 		Protocol: protocolVersion, LocalRoot: bridge.LocalRoot, RemoteRoot: h.paths.replica, OS: bridge.OS,
 		Shell: bridge.Shell, ID: h.id, LocalSearch: bridge.LocalSearch, ExecSocket: h.paths.exec,
-		Secret: hostExecSecret(h.paths), Replica: true, LiveRoot: h.paths.live,
+		Secret: hostExecSecret(h.paths), Replica: true, LiveRoot: h.paths.live, Shallow: bridge.Shallow,
 	}
 	return writeJSON(h.paths.config, c)
 }
@@ -264,6 +264,8 @@ func (h *sessionHost) mountLive(cfg SessionConfig) {
 	lc := cfg
 	lc.RemoteRoot, lc.ExecSocket = h.paths.live, ""
 	lc.ConfigSnapshot, lc.GitSnapshot, lc.BulkRead = true, true, true
+	// Without a replica, Claude's configuration is read through this view.
+	lc.ExtraConfig = cfg.Shallow
 	if err := writeJSON(h.paths.liveConfig, lc); err != nil {
 		log.Printf("live view: %v", err)
 		return
@@ -513,7 +515,11 @@ func claudeCommand(configPath string, extraArgs []string, termEnv map[string]str
 	if err := verifyClaudeVersion(claudeBinary, filepath.Join(stateDir(), "claude-version.json")); err != nil {
 		return nil, err
 	}
-	prompt := fmt.Sprintf("This session uses remote-claude. Claude runs on a Linux server; the project lives on the developer's %s computer at %s, and shell commands, Git, hooks and stdio MCP servers run there. File tools work on a continuously synchronised copy at %s: your edits reach the developer's computer before the next command runs, and command results are synchronised back before you see them. Paths ignored by Git (dependencies, build output, local secrets) and .git appear as symlinks to the developer's files and are read over the network. Use project-relative paths in commands whenever possible. Do not install project dependencies on the server. Server home configuration is not the developer's personal configuration.", c.OS, c.LocalRoot, c.RemoteRoot)
+	files := fmt.Sprintf("File tools work on a continuously synchronised copy at %s: your edits reach the developer's computer before the next command runs, and command results are synchronised back before you see them. Paths ignored by Git (dependencies, build output, local secrets) and .git appear as symlinks to the developer's files and are read over the network.", c.RemoteRoot)
+	if c.Shallow {
+		files = fmt.Sprintf("This directory is not copied to the server: every entry of %s is a symlink to the developer's files, read over the network, so prefer searches and targeted reads over reading many files.", c.RemoteRoot)
+	}
+	prompt := fmt.Sprintf("This session uses remote-claude. Claude runs on a Linux server; the directory lives on the developer's %s computer at %s, and shell commands, Git, hooks and stdio MCP servers run there. %s Use relative paths in commands whenever possible. Do not install project dependencies on the server. Server home configuration is not the developer's personal configuration.", c.OS, c.LocalRoot, files)
 	args := append([]string{"--setting-sources", "project,local", "--append-system-prompt", prompt}, extraArgs...)
 	cmd := exec.Command(claudeBinary, args...)
 	cmd.Dir = c.RemoteRoot

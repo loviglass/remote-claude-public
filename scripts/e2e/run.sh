@@ -39,9 +39,12 @@ echo "// needle" >> "$P0/src/f7.go"
 for i in $(seq 1 300); do echo "module.exports = $i // needle" > "$P0/node_modules/pkg/m$i.js"; done
 echo "module.exports = 1" > "$P0/node_modules/pkg/index.js"
 printf 'node_modules/\n*.log\n' > "$P0/.gitignore"
-git -C "$P0" init -q -b main
-git -C "$P0" -c user.name=e2e -c user.email=e2e@example.com add -A
-git -C "$P0" -c user.name=e2e -c user.email=e2e@example.com commit -qm initial
+# E2E_PLAIN=1 checks a directory outside Git, which is not copied.
+if [ -z "${E2E_PLAIN:-}" ]; then
+  git -C "$P0" init -q -b main
+  git -C "$P0" -c user.name=e2e -c user.email=e2e@example.com add -A
+  git -C "$P0" -c user.name=e2e -c user.email=e2e@example.com commit -qm initial
+fi
 
 port=2221
 for v in "${variants[@]}"; do

@@ -147,6 +147,7 @@ func (w *worker) handle(c net.Conn) {
 			s := newSyncPC(w.fs.root, w.config.LocalRoot, w.config.RemoteRoot, w.ignores, func(p string, data []byte, unwrap bool) ([]byte, error) {
 				return projectJSON(data, unwrap, w.fs.projectMCP)
 			})
+			s.scanner.shallow = w.config.Shallow
 			w.syncMu.Lock()
 			if w.sync != nil {
 				w.sync.close()

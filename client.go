@@ -182,6 +182,7 @@ func connect(args []string) (result error) {
 	jsonOut := fs.Bool("json", false, "JSON output for a non-interactive run")
 	doctor := fs.Bool("check", false, "verify SSH, file transport and local commands without calling Claude")
 	freshMetadata := fs.Bool("fresh-metadata", false, "disable the short file metadata cache (slower on high-latency links)")
+	liveOnly := fs.Bool("live", false, "do not copy the project to the server; read files over the network")
 	serverSearch := fs.Bool("server-search", false, "use the compatibility search over SSHFS instead of workstation ripgrep")
 	shell := fs.String("shell", "auto", "auto, bash, or powershell")
 	forceNew := fs.Bool("force-new", false, "with --server: start a job even if another account already runs this project")
@@ -297,6 +298,13 @@ func connect(args []string) (result error) {
 	}
 	cfg := SessionConfig{Protocol: protocolVersion, Secret: randomID(), HostKey: string(ssh.MarshalAuthorizedKey(signer.PublicKey())), LocalRoot: root, RemoteRoot: location, OS: runtime.GOOS, Shell: os.Getenv("SHELL"), ID: id, FreshMetadata: *freshMetadata, Replica: true}
 	cfg.LocalSearch = !*serverSearch && workstationSearchAvailable()
+	ignores := loadIgnoreRules(root)
+	if ok, why := replicaSuitable(root, ignores); *liveOnly || !ok {
+		cfg.Shallow = true
+		if !ok && interactive {
+			fmt.Fprintf(os.Stderr, "remote-claude: %s is %s; files stay on this computer and are read over the network.\n", root, why)
+		}
+	}
 	if *shell != "auto" && *shell != "bash" && *shell != "powershell" {
 		return fmt.Errorf("shell must be auto, bash, or powershell")
 	}
@@ -313,7 +321,7 @@ func connect(args []string) (result error) {
 		return e
 	}
 	defer ln.Close()
-	w := &worker{config: cfg, fs: &projectFS{root: r}, signer: signer, close: make(chan struct{}), ignores: loadIgnoreRules(root), synced: make(chan *syncPC, 1)}
+	w := &worker{config: cfg, fs: &projectFS{root: r}, signer: signer, close: make(chan struct{}), ignores: ignores, synced: make(chan *syncPC, 1)}
 	defer w.cleanup()
 	httpProxies := &httpMCPProxies{listen: client.Listen, worker: w}
 	defer httpProxies.close()
