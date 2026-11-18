@@ -90,6 +90,9 @@ func serverPrepare() error {
 	if e := os.MkdirAll(paths.dir, 0700); e != nil {
 		return e
 	}
+	if legacySessionActive(paths) {
+		return fmt.Errorf("this project is open in a session of an older remote-claude version; exit that session first")
+	}
 	c.Replica, c.LiveRoot = true, paths.live
 	if e := writeJSON(paths.bridge, c); e != nil {
 		return e
@@ -139,4 +142,25 @@ func enrollServer() error {
 		return e
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]bool{"ok": true})
+}
+
+// legacySessionActive reports whether a pre-0.3 session still serves this
+// project through an SSHFS mount at the replica path. Its mount is only
+// reclaimed once its workstation bridge is unreachable.
+func legacySessionActive(p hostPaths) bool {
+	old, err := os.ReadFile(filepath.Join(p.dir, "active"))
+	if err != nil || !validName(string(old)) {
+		return false
+	}
+	var c SessionConfig
+	if readJSON(filepath.Join(stateDir(), "sessions", string(old)+".json"), &c) != nil {
+		return false
+	}
+	conn, err := dialBridge(c)
+	if err != nil {
+		os.Remove(filepath.Join(p.dir, "active"))
+		return false
+	}
+	conn.Close()
+	return true
 }

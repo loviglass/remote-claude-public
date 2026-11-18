@@ -538,7 +538,8 @@ func claudeCommand(configPath string, extraArgs []string, termEnv map[string]str
 	commandPath := gitDir + ":" + os.Getenv("PATH")
 	if c.OS == "windows" || c.Shell == "powershell" {
 		env = append(env, "CLAUDE_CODE_USE_POWERSHELL_TOOL=1")
-		commandPath = "/opt/remote-claude/windows:" + commandPath
+		// The adapter belongs to this server binary, so releases can coexist.
+		commandPath = filepath.Join(filepath.Dir(serverBinary), "windows") + ":" + commandPath
 	}
 	cmd.Env = append(env, "PATH="+commandPath)
 	return cmd, nil
