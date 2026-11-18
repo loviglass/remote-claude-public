@@ -2,7 +2,7 @@
 
 **Self-hosted Claude Code infrastructure for teams and solo developers.**
 
-Remote Claude is a self-hosted SSH bridge for [Claude Code](https://code.claude.com/). It runs the Claude Code interface and conversation state on a Linux server you control, while a workstation can keep ownership of the project files, commands, builds, hooks and MCP servers. A separate server mode runs a committed task entirely on the server, inside tmux and Docker, so the workstation can disconnect.
+Remote Claude is a self-hosted SSH bridge for [Claude Code](https://code.claude.com/). It runs the Claude Code interface and conversation state on a Linux server you control, while a workstation can keep ownership of the project files, commands, builds, hooks and MCP servers. Claude edits a synchronised replica of the project on the server, so file access costs no network round trip, and its session survives disconnects. A separate server mode runs a task autonomously on the server, starting from the workstation's exact working tree, so the workstation can disconnect.
 
 The same Go executable provides the workstation client, the server, the temporary SSH/SFTP bridge and command dispatcher. No inbound port, SSH server, Node.js or Python installation is required on the workstation.
 
@@ -146,7 +146,7 @@ remote-claude --resume=SESSION_ID .     # a specific conversation
 remote-claude --continue .              # latest conversation, no picker
 remote-claude --print "Explain this" .  # one non-interactive request
 remote-claude ssh                       # shell on the server
-remote-claude --server .                # pushed task on the server
+remote-claude --server .                # autonomous task from this working tree
 remote-claude --server --resume .       # resume its checkout/conversation
 remote-claude night /absolute/checkout  # existing server-side checkout
 remote-claude version                   # version and source commit
@@ -158,11 +158,11 @@ Use `--profile NAME` to select a non-default connection profile. Arguments after
 remote-claude . -- --model sonnet
 ```
 
-For server mode, push the current commit first. Configure Git hosting credentials on the server with `remote-claude ssh` and `gh auth login`, or provide an SSH key for an SSH `origin`.
+Server mode needs no push: unpushed commits and uncommitted changes travel with the task. To let the task fetch, push and open pull requests, configure Git hosting credentials on the server with `remote-claude ssh` and `gh auth login`, or provide an SSH key for an SSH `origin`.
 
 ## Self-hosting overview
 
-The supported server layout is Ubuntu Linux with systemd, OpenSSH, Python 3 and an Ed25519 SSH host key. Local mode additionally needs `sshfs`; server mode needs Docker, tmux and sudo. The current adapter is pinned to **Claude Code 2.1.292** and deliberately disables its automatic updater.
+The supported server layout is Ubuntu Linux with systemd, OpenSSH, Python 3 and an Ed25519 SSH host key. Local mode additionally needs `sshfs` and FUSE (for the live view of ignored files); server mode needs tmux, plus Docker and sudo only for projects with `.remote-claude/Dockerfile`. The current adapter is pinned to **Claude Code 2.1.292** and deliberately disables its automatic updater.
 
 The fixed server installation prefix is `/opt/remote-claude`. To install:
 
@@ -206,7 +206,7 @@ The fixed server installation prefix is `/opt/remote-claude`. To install:
    python3 scripts/new-invitation.py --host ssh.example.com seconddeveloper
    ```
 
-   Add `--resources` only when Docker/tmux resource limits and server mode should also be configured.
+   Add `--resources` only when resource limits and server mode should also be configured.
 
 The complete server guide, including egress routing, resource policies, updates, revocation and recovery, is in [ADMIN.ru.md](ADMIN.ru.md).
 
@@ -214,7 +214,7 @@ The complete server guide, including egress routing, resource policies, updates,
 
 | Configuration | Behavior |
 |---|---|
-| `CLAUDE.md`, nested instructions, `.claude/rules` | Read natively from the mounted project |
+| `CLAUDE.md`, nested instructions, `.claude/rules` | Read natively from the project replica |
 | `.claude/settings.json`, `settings.local.json` | Project/local settings and `env` are applied |
 | Skills, commands, agents, output styles | Visible to Claude; supported YAML-frontmatter hooks are adapted |
 | Command hooks | Run on the workstation; JSON I/O and exit status are preserved |
@@ -229,8 +229,8 @@ Executable configuration entries are temporarily shown to Claude as transport ad
 
 - Server SSH is authenticated by a pinned host fingerprint; enrollment is one-time and replaces the bootstrap key with a workstation public key.
 - OAuth tokens remain in managed server home directories. Any managed user who can read their own server copy must be trusted; Linux accounts are not a hard security boundary against the server administrator.
-- Workstation commands run with the full rights of the local user and are **not sandboxed to the project**. Only the SFTP/search path layer is rooted.
-- Server containers isolate toolchains and resource usage, not hostile users: they mount the user's home, use host networking and build project Dockerfiles with root build steps. Enable server mode only for trusted participants.
+- Workstation commands run with the full rights of the local user and are **not sandboxed to the project**. Only the synchronisation, SFTP and search path layers are rooted.
+- Server jobs run autonomously with the full rights of the user's server account, without approval prompts. Optional job containers isolate toolchains and resource usage, not hostile users: they mount the user's home, use host networking and build project Dockerfiles with root build steps. Enable server mode only for trusted participants.
 - Client updates arrive over the pinned SSH connection and are checked against SHA-256 hashes from the server manifest. There is no independent update signature; the server administrator is part of the trust boundary.
 - Release archives contain no invitations, OAuth files, private keys, administrator guide or local verification reports. CI also scans Git history for credentials.
 
@@ -239,11 +239,13 @@ See [SECURITY.md](SECURITY.md) for reporting and deployment recommendations.
 ## Known limitations
 
 - The adapter is verified against Claude Code 2.1.292; other versions require explicit testing and a source change.
-- Local mode depends on network RTT. Caches reduce round trips but do not make remote reads instantaneous. Local editor changes normally become visible after short cache expiry plus network delay; OS inotify events are not forwarded.
+- Commands, Git calls and searches that include ignored files cost one network round trip; keystrokes travel to the server and back. Reads of Git-ignored files go through the live SSHFS view and take several round trips.
+- The first start of a project copies its non-ignored files to the server; the replica uses server disk space per user and project.
+- Editor changes on Linux reach the replica within a round trip; on macOS and Windows they are noticed by periodic scans, typically within a second or two.
 - Windows retains its native case, locking, ACL and symlink semantics. Bash hooks on Windows require a Bash implementation such as Git for Windows. PowerShell `-File` adaptation is not supported in the pinned version.
-- Persistent `cd` outside the exported project is rejected. Local commands can still use absolute paths with the user's normal permissions.
+- A persistent `cd` outside the project is not kept: the command runs, and the working directory stays in the project. Local commands can still use absolute paths with the user's normal permissions.
 - LSP-heavy plugins, plugins with their own binary/JavaScript integrations, third-party MCP OAuth, automatic worktrees outside the exported tree and Claude's native OS sandbox are not adapted.
-- Server mode requires pushed work and trusted users. Its parallel-job check is non-atomic and observes running containers only.
+- Server mode requires trusted users. Its parallel-job check is non-atomic and observes running containers only.
 - Resource limits apply to new managed sessions after administrator configuration; direct unmanaged Claude processes bypass them.
 - Linux is the primary tested platform. Windows and macOS archives are cross-compiled, but their installers and runtime behavior still require validation on physical systems before making stronger support claims.
 
