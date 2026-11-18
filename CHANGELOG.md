@@ -2,6 +2,11 @@
 
 All notable changes are documented here. Release binaries are immutable and tied to the tagged source commit.
 
+## 0.3.1 — no copies outside projects
+
+- The replica is built only for a Git project of reasonable size (up to 50,000 non-ignored files and 1 GiB). The home directory, a filesystem root, directories outside Git and larger trees are not copied: their entries are links into the live view and files are read over the network, as before 0.3.0. `--live` forces this mode.
+- Server-side searches without a path no longer read stdin instead of the directory; replica searches skip Git's ignore rules, which the replica already applies.
+
 ## 0.3.0 — replica and persistent sessions
 
 ### Interactive mode
