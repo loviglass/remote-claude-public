@@ -17,7 +17,9 @@ const worktreeIdleLimit = 24 * time.Hour
 
 // Remove worktrees under .claude/worktrees that are clean, unlocked and idle.
 // Branches stay, so commits survive; uncommitted or untracked files keep the
-// worktree. The idle limit protects a fresh worktree an agent is still using.
+// worktree. The idle limit protects a fresh worktree an agent is still using,
+// and Claude's own lock outlives a killed agent, so it does not count; its PID
+// belongs to the VPS and cannot be checked from here. Other locks are honored.
 func pruneIdleWorktrees(root string, idle time.Duration) (removed int) {
 	top, e := exec.Command("git", "-C", root, "rev-parse", "--show-toplevel").Output()
 	if e != nil {
@@ -40,6 +42,9 @@ func pruneIdleWorktrees(root string, idle time.Duration) (removed int) {
 		if e != nil || len(status) > 0 {
 			continue
 		}
+		if w.agentLocked && exec.Command("git", "-C", root, "worktree", "unlock", w.path).Run() != nil {
+			continue
+		}
 		// Without --force Git refuses again if anything changed meanwhile.
 		if exec.Command("git", "-C", root, "worktree", "remove", w.path).Run() == nil {
 			removed++
@@ -49,8 +54,9 @@ func pruneIdleWorktrees(root string, idle time.Duration) (removed int) {
 }
 
 type listedWorktree struct {
-	path   string
-	locked bool
+	path        string
+	locked      bool
+	agentLocked bool
 }
 
 func parseWorktreeList(b []byte) []listedWorktree {
@@ -60,6 +66,8 @@ func parseWorktreeList(b []byte) []listedWorktree {
 		line := s.Text()
 		if p, ok := strings.CutPrefix(line, "worktree "); ok {
 			a = append(a, listedWorktree{path: filepath.Clean(filepath.FromSlash(p))})
+		} else if len(a) > 0 && strings.HasPrefix(line, "locked claude agent ") {
+			a[len(a)-1].agentLocked = true
 		} else if len(a) > 0 && (line == "locked" || strings.HasPrefix(line, "locked ")) {
 			a[len(a)-1].locked = true
 		}

@@ -52,3 +52,7 @@ func restartSelf() error {
 	}
 	return e
 }
+
+func exitSignal(*exec.ExitError) int { return 2 }
+
+func resizeSignals() <-chan os.Signal { return nil }

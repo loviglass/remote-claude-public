@@ -54,7 +54,8 @@ func writeRemoteCwd(c SessionConfig, file, cwd string) error {
 	if p == root || strings.HasPrefix(p, root+"/") {
 		p = c.RemoteRoot + strings.TrimPrefix(p, root)
 	} else {
-		return fmt.Errorf("command changed directory outside exported project; cwd is %s", p)
+		// The command itself succeeded; only the persistent directory stays.
+		return fmt.Errorf("the working directory stays in the project; %s is outside it", p)
 	}
 	return os.WriteFile(file, []byte(p+"\n"), 0600)
 }

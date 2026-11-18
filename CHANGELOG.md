@@ -2,6 +2,40 @@
 
 All notable changes are documented here. Release binaries are immutable and tied to the tagged source commit.
 
+## 0.3.0 — replica and persistent sessions
+
+### Interactive mode
+
+- Claude's file tools work on a replica of the project on the server's disk instead of an SSHFS mount: reads, edits, directory walks and searches no longer wait for the network. Git-ignored paths, `.git` and files over 16 MiB stay on the workstation behind symlinks into a live SSHFS view.
+- Two-way synchronisation with command barriers: a workstation command always sees Claude's latest edits, and Claude always sees the command's file changes. The workstation wins conflicts; Claude's losing version is kept and reported.
+- A persistent session host keeps Claude running across SSH drops; the client reattaches to the same process instead of restarting it with `--continue`.
+- Commands, Git calls and hooks cost one round trip instead of two (`rc-exec` channel).
+- Measured with a 160 ms round trip: a scripted session (100 file reads, tree walk, edit, five commands, Git, two searches) dropped from 145 s to 5.7 s.
+- Terminal resizes propagate immediately (SIGWINCH); `TERM`, `COLORTERM`, `TERM_PROGRAM` and a UTF-8 locale reach Claude.
+- Faster start: the server location is cached and the update check overlaps preparation.
+
+### Server mode
+
+- Starts from the workstation's exact working tree: unpushed commits and uncommitted files travel as a Git bundle; the developer's repository is not modified.
+- Runs under the developer's account by default, with access to the server, its services and databases; containers only for projects with `.remote-claude/Dockerfile`.
+- Runs autonomously: all tools are allowed; deny rules block PR merges, force pushes and remote branch deletion.
+
+### Fixes
+
+- Reconnect backoff restarts after a healthy session instead of staying at 16 s for the rest of the day.
+- A failing command keeps the working directory it changed to, like a local shell; `cd` outside the project no longer turns a successful command into an error.
+- A command killed by a signal reports 128 + signal (for example 137) instead of 130.
+- The request de-duplication set no longer grows for the whole session.
+- Files created through the live view honour the umask instead of always being 0600.
+- `x/../.mcp.json`-style paths can no longer bypass configuration projection.
+- Commands no longer inherit the client supervisor's private environment, so a client started by a command does not act as the session's worker.
+- Idle agent worktrees left locked by a killed Claude agent are pruned too; other locks are still honoured.
+
+### Upgrading
+
+- Sessions started by an earlier release keep working while the server binary is replaced: new command adapters fall back to the earlier executor protocol, and a project open in such a session is not taken over until that session ends.
+- Clients update themselves from the server manifest at their next connection.
+
 ## 0.2.0 — public self-hosted release
 
 ### Publication and configuration

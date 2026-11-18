@@ -28,7 +28,11 @@ type worker struct {
 	config   SessionConfig
 	fs       *projectFS
 	signer   ssh.Signer
-	seen     sync.Map
+	seen     recentIDs
+	ignores  *ignoreRules
+	syncMu   sync.Mutex
+	sync     *syncPC
+	synced   chan *syncPC
 	close    chan struct{}
 	wg       sync.WaitGroup
 	envMu    sync.Mutex
@@ -104,16 +108,115 @@ func (w *worker) handle(c net.Conn) {
 	}()
 	go ssh.DiscardRequests(reqs)
 	for ch := range chs {
-		if ch.ChannelType() != "session" {
-			ch.Reject(ssh.UnknownChannelType, "session required")
-			continue
+		switch ch.ChannelType() {
+		case "session":
+			channel, requests, e := ch.Accept()
+			if e == nil {
+				go w.handleSession(channel, requests)
+			}
+		case execChannelType:
+			var q ExecRequest
+			if decode(string(ch.ExtraData()), &q) != nil || q.ID == "" || !w.seen.add(q.ID) {
+				ch.Reject(ssh.Prohibited, "invalid or repeated request")
+				continue
+			}
+			if !w.begin() {
+				ch.Reject(ssh.Prohibited, "session is closing")
+				continue
+			}
+			channel, requests, e := ch.Accept()
+			if e != nil {
+				w.active.Done()
+				continue
+			}
+			go func() {
+				defer w.active.Done()
+				defer channel.Close()
+				w.runChannel(channel, requests, q)
+			}()
+		case "rc-sync":
+			if !w.config.Replica {
+				ch.Reject(ssh.UnknownChannelType, "replica mode is off")
+				continue
+			}
+			channel, requests, e := ch.Accept()
+			if e != nil {
+				continue
+			}
+			go ssh.DiscardRequests(requests)
+			s := newSyncPC(w.fs.root, w.config.LocalRoot, w.config.RemoteRoot, w.ignores, func(p string, data []byte, unwrap bool) ([]byte, error) {
+				return projectJSON(data, unwrap, w.fs.projectMCP)
+			})
+			w.syncMu.Lock()
+			if w.sync != nil {
+				w.sync.close()
+			}
+			w.sync = s
+			w.syncMu.Unlock()
+			if w.synced != nil {
+				select {
+				case w.synced <- s:
+				default:
+				}
+			}
+			go s.serve(channel)
+		default:
+			ch.Reject(ssh.UnknownChannelType, "unsupported channel")
 		}
-		channel, requests, e := ch.Accept()
-		if e != nil {
-			continue
-		}
-		go w.handleSession(channel, requests)
 	}
+}
+
+func (w *worker) begin() bool {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	if w.closing {
+		return false
+	}
+	w.active.Add(1)
+	return true
+}
+
+func (w *worker) currentSync() *syncPC {
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
+	return w.sync
+}
+
+func (w *worker) runChannel(ch ssh.Channel, requests <-chan *ssh.Request, q ExecRequest) {
+	done := make(chan struct{})
+	go func() {
+		for r := range requests {
+			if r.WantReply {
+				r.Reply(false, nil)
+			}
+		}
+		close(done)
+	}()
+	result := w.execute(q, ch, ch, ch.Stderr(), done)
+	b, _ := json.Marshal(result)
+	ch.SendRequest("remote-claude-result", false, b)
+	ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Code uint32 }{uint32(result.Code)}))
+}
+
+// recentIDs remembers request IDs long enough to reject a replayed request
+// without growing for the whole session.
+type recentIDs struct {
+	mu   sync.Mutex
+	cur  map[string]bool
+	prev map[string]bool
+}
+
+func (r *recentIDs) add(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cur[id] || r.prev[id] {
+		return false
+	}
+	if r.cur == nil || len(r.cur) >= 4096 {
+		r.prev, r.cur = r.cur, map[string]bool{}
+	}
+	r.cur[id] = true
+	return true
 }
 func (w *worker) handleSession(ch ssh.Channel, requests <-chan *ssh.Request) {
 	defer ch.Close()
@@ -146,7 +249,7 @@ func (w *worker) handleSession(ch ssh.Channel, requests <-chan *ssh.Request) {
 				r.Reply(false, nil)
 				return
 			}
-			if _, dup := w.seen.LoadOrStore(q.ID, true); dup {
+			if !w.seen.add(q.ID) {
 				r.Reply(false, nil)
 				return
 			}
@@ -186,7 +289,9 @@ func (w *worker) env(q ExecRequest) map[string]string {
 	e := map[string]string{}
 	for _, s := range os.Environ() {
 		k, v, ok := strings.Cut(s, "=")
-		if ok {
+		// The client's private supervisor state must not leak into commands:
+		// a remote-claude started by a command would act as this session.
+		if ok && !strings.HasPrefix(k, "_REMOTE_CLAUDE_") {
 			e[k] = v
 		}
 	}
@@ -221,6 +326,24 @@ func expandVars(s string, env map[string]string) string {
 	})
 }
 func (w *worker) execute(q ExecRequest, in io.Reader, out, errout io.Writer, disconnected <-chan struct{}) ExecResult {
+	s := w.currentSync()
+	if s != nil && q.SyncSeq > 0 && !s.waitApplied(q.SyncSeq, q.SyncEpoch, 30*time.Second) {
+		fmt.Fprintln(errout, "remote-claude: Claude's latest file edits have not reached this computer yet; the command runs anyway.")
+	}
+	result := w.executeCommand(q, in, out, errout, disconnected)
+	if s != nil && q.SyncAfter {
+		if seq, epoch, ok := s.barrier(time.Minute); ok {
+			result.SyncSeq, result.SyncEpoch = seq, epoch
+		}
+	}
+	return result
+}
+
+func (w *worker) executeCommand(q ExecRequest, in io.Reader, out, errout io.Writer, disconnected <-chan struct{}) ExecResult {
+	if q.Kind == "sync" {
+		// Only the barriers: used when Claude finishes.
+		return ExecResult{Code: 0}
+	}
 	if q.Kind == "read-file" {
 		return w.readFileSnapshot(q, out)
 	}
@@ -467,7 +590,8 @@ func (w *worker) execute(q ExecRequest, in io.Reader, out, errout io.Writer, dis
 	} else if x, ok := e.(*exec.ExitError); ok {
 		result.Code = x.ExitCode()
 		if result.Code < 0 {
-			result.Code = 130
+			// Killed by a signal: report it the way a shell does.
+			result.Code = 128 + exitSignal(x)
 		}
 	} else {
 		result.Error = e.Error()

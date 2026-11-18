@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implemented behavior of Remote Claude 0.2.0. It is a technical reference, not a compatibility promise for every Claude Code extension. The adapter is pinned to Claude Code 2.1.292.
+This document describes the implemented behavior of Remote Claude 0.3.0. It is a technical reference, not a compatibility promise for every Claude Code extension. The adapter is pinned to Claude Code 2.1.292.
 
 ## 1. Processes and trust domains
 
@@ -34,8 +34,10 @@ For a local interactive session the client:
 5. Requests a stable per-project server path based on the identity and local project path.
 6. Starts a temporary loopback SSH/SFTP server rooted at the local project.
 7. Opens reverse SSH forwarding from the server to that loopback listener.
-8. Sends a versioned `SessionConfig` to `server prepare`.
-9. Mounts the project with SSHFS and starts Claude through a separate terminal connection.
+8. Sends a versioned `SessionConfig` to `server prepare`, which starts or reuses the project's session host and binds it to the new bridge.
+9. Waits until the replica and the workstation agree, then attaches the separate terminal connection to Claude's PTY in the host.
+
+The server path of the replica is cached per profile, and the update check overlaps session preparation, so a reconnect costs two SSH handshakes, one preparation call and the bridge handshake.
 
 Only Ed25519 server host keys are accepted. The bridge itself has a random per-session secret and an ephemeral host key. The workstation listener uses `127.0.0.1:0`; no public listener is created.
 
@@ -67,7 +69,7 @@ The main execution paths are:
 - **Git:** a PATH shim redirects project Git commands to the workstation. Server-side Git outside the exported project remains server-side.
 - **Hooks/MCP:** projected configuration invokes `remote-claude dispatch` with the original specification encoded in the request.
 
-The SFTP process owns an authenticated workstation connection. A private Unix socket with mode `0600` provides a local SSH endpoint that reuses this connection for shell, Git, hooks and MCP channels. This avoids repeated SSH handshakes and their latency.
+The session host owns an authenticated workstation connection. A private Unix socket with mode `0600` provides a local SSH endpoint that reuses it for shell, Git, hooks and MCP. Each command is one `rc-exec` channel whose open request carries the command, so a command costs one round trip plus its own run time; the synchronisation barriers (§5) ride along.
 
 Execution behavior:
 
@@ -83,42 +85,43 @@ If transport disappears after a command was accepted, its outcome is unknown. Th
 
 **Commands are not sandboxed.** They inherit the workstation user's normal ability to access the rest of the system. Rooting applies to the file transport and validated search operands, not arbitrary shell commands.
 
-## 5. Filesystem and read behavior
+## 5. Replica synchronisation
 
-The workstation SFTP implementation is rooted with `os.Root` and normalizes traversal. Supported operations include:
+Claude works on a replica of the project in `~/.local/share/remote-claude/projects/<id>/worktree` on the server's disk. The workstation remains the owner of the project.
 
-- open/read/write and streaming;
-- list, lstat, readlink and setstat;
-- rename and POSIX rename;
-- remove/rmdir and mkdir;
-- symlink and hard link.
+What is replicated:
 
-Regular files up to 256 KiB can be returned in one bulk-read RPC. At most eight such snapshots are held concurrently per bridge. Larger files and writes use streaming SFTP.
-
-Ordinary file contents are not cached between opens. This is important when a local editor changes a file while Claude is working. The caches are instead focused on metadata and discovery:
-
-| Mechanism | Behavior |
+| Workstation path | Replica |
 |---|---|
-| SSHFS metadata cache | Approximately one second; disabled by `--fresh-metadata` |
-| Negative lookup cache | Missing paths remembered for at most one second, bounded at 4096 entries; invalidated by writes/commands |
-| Configuration snapshot | Batched in memory, background revalidation after one second and mandatory refresh when stale beyond five seconds |
-| Small-file reads | Up to 256 KiB, at most eight concurrent snapshots; not a cross-open content cache |
+| Files and directories Git does not ignore (including untracked ones) | Real files, kept in sync both ways |
+| Git-ignored paths, `.git`, files over 16 MiB | Symlinks to the same path in the live SSHFS view (`projects/<id>/live`) |
+| Sockets, FIFOs, devices | Not shown |
 
-The configuration snapshot has explicit limits: 32 MiB of source content, 10,000 entries and 64 MiB of encoded data. Exceeding a limit produces an error rather than an incomplete silent snapshot. `--fresh-metadata` is the compatibility fallback.
+Ignore rules are the project's `.gitignore` files, `info/exclude`, the global excludes file and unanchored rules of parent directories. Outside Git a small default list (`node_modules`, virtual environments, Python caches) applies. A rule mismatch only moves a path between the replica and the live view; both show the workstation's content.
 
-Root listings remain live. Git snapshot data includes root/`.git` metadata, `HEAD`, `config`, refs and `packed-refs`; `.git/index` and Git objects are not baked into the snapshot.
+Protocol:
 
-Local editor events are not forwarded as server inotify events. Visibility therefore depends on cache expiry, file reopening and network delay, usually a few seconds rather than an instant file-watcher notification.
+- Each side keeps the last version both agree on (the base): kind, permission bits, content hash and the stat of each copy. The server persists it, so a later session transfers only differences.
+- A side detects its changes by scanning (stat comparison, then hashing changed files) and sends them with the base hash they replace. File events (inotify, ReadDirectoryChangesW) trigger scans promptly; periodic scans are the safety net and the macOS mechanism.
+- Each direction is one ordered gob stream with sequence numbers over an SSH channel of the bridge. Data messages are bounded in flight; control messages are not, so the two receive loops cannot deadlock.
+- Files are replaced atomically (temporary file and rename in the same directory, through `os.Root`), so neither Claude nor a local editor reads a half-written file and no path can escape the project.
+- Claude configuration with executable entries is projected on its way to the replica and unprojected on its way back (§7); the base tracks both forms.
+
+Command barriers:
+
+1. Before a workstation command, the server scans the replica and sends Claude's changes; the request carries the last sequence number, and the workstation waits until it has applied it.
+2. After a command that can change files, the workstation scans and returns its last sequence number with the result; the server applies the changes before returning the result to Claude.
+3. Read-only Git commands, searches and MCP starts skip the second barrier.
+
+Conflicts: the workstation always wins. If Claude's unsynchronised edit loses, it is saved under `projects/<id>/conflicts/` and the next command's output tells Claude. Simultaneous identical edits and lost acknowledgements resolve without a conflict. The replication window between a workstation check and an atomic replacement is closed by re-checking just before the rename.
+
+Reconnects: Claude keeps working on the replica while the workstation is away. The next connection transfers the base, the workstation reports its changes first, and then Claude's offline edits go to the workstation. A replica without persisted state is treated as disposable: leftovers are removed instead of resurrected.
+
+The live SSHFS view keeps the metadata cache, `.git` snapshot and single-request small-file reads of earlier versions. It is aborted when the bridge disappears, so reads of ignored paths fail fast instead of hanging.
 
 ## 6. Search
 
-When `remote-claude-rg` is installed beside the client, or `rg` is available on the workstation PATH, supported native searches run locally with configuration files and preprocessors disabled. Explicit operands are confined to the exported root and special files are rejected.
-
-Argument rewriting is conservative. Unsupported options, outside-project cwd, help/version requests and symlink-following cases fall back to the server ripgrep at `/opt/remote-claude/rg`.
-
-The adapter rewrites path operands where necessary, not regular expressions, replacements or matched content. Results use project-relative paths. `--server-search` forces the compatibility path.
-
-Release builders bundle ripgrep 15.2.0 and verify pinned upstream archive SHA-256 hashes.
+Searches without `--no-ignore*`, `-u` or `--follow` run with the server's ripgrep on the replica: the replica holds exactly the files such a search can see. Others run with workstation ripgrep (`remote-claude-rg` beside the client, or `rg` on the PATH), with configuration files and preprocessors disabled, explicit operands confined to the project and special files rejected. Without workstation ripgrep they run on the server with `--follow` through the live view.
 
 ## 7. Project configuration, hooks and MCP
 
@@ -150,38 +153,39 @@ Personal workstation `~/.claude` is not imported. Third-party MCP OAuth flows, L
 
 ## 8. Reconnect and lifecycle
 
-Interactive clients run under a supervisor. A child exits with a retry marker after a transport failure; the parent starts a clean child so stale SSH goroutines cannot retain the terminal.
+A session host (`remote-claude server host <id>`) owns each project on the server. It starts on the first `prepare`, runs in its own session and keeps:
 
-- Local interactive mode continues the selected conversation. Bare `--resume` is not shown a second time after a drop; an explicit session ID is preserved.
-- Server mode sets reattach-only behavior and joins the existing tmux session without creating another job or image.
-- Delays are 1, 2, 4, 8 and 16 seconds, then capped.
-- `Ctrl+C` interrupts the retry loop.
-- `--print`, doctor and JSON output are not automatically retried.
+- the replica and its synchronisation state;
+- the bridge to the current workstation connection, with keepalives every 10 seconds;
+- the command executor socket, which waits up to a minute for a workstation that is reconnecting;
+- Claude's PTY. Output goes to the attached terminal; without one it is dropped and the next attach makes Claude redraw.
 
-The server watchdog checks the bridge every 15 seconds. A dead bridge causes Claude to terminate and allows a stale FUSE mount to be aborted. A newer session can reclaim a project lock only after the old bridge is shown unreachable.
+Interactive clients run under a supervisor. A child exits with a retry marker after a transport failure; the parent starts a clean child, which reconnects, rebinds the host and reattaches. Delays are 1, 2, 4, 8 and 16 seconds and restart after a session that ran for 30 seconds. `Ctrl+C` interrupts the retry loop. `--print`, doctor and JSON output are not retried. The supervisor's private environment is removed from commands, so a client started by a command is independent.
 
-Clean, unlocked agent worktrees under `.claude/worktrees` that have been idle for more than 24 hours are pruned at interactive startup to reduce filesystem stalls. Branches are retained.
+The host stops Claude after 12 hours without an attached terminal, and exits when Claude has exited and its terminal has seen it, or after two idle minutes when it never ran Claude (print and check runs).
+
+Clean, unlocked agent worktrees under `.claude/worktrees` that have been idle for more than 24 hours are pruned at interactive startup. Branches are retained.
 
 ## 9. Server jobs
 
-For `remote-claude --server PROJECT`, the client sends the repository origin, current commit, branch and Claude arguments. It does not upload the working tree.
+For `remote-claude --server PROJECT`, the client records the working tree as a commit on top of `HEAD`, using a copy of the index so the developer's index, worktree and branches stay untouched. A Git bundle with that commit and any commits `origin` lacks is uploaded with `server job-upload`.
 
 The server:
 
-1. Verifies that the commit exists on `origin`.
-2. Creates or reuses `~/server-jobs/<name>-<origin-hash>`.
-3. Creates `claude/<branch>-<UTC timestamp>` for a new task.
+1. Creates or reuses `~/server-jobs/<name>-<origin-hash>` and fetches `origin`.
+2. Unpacks the bundle and verifies that the workstation's `HEAD` is available.
+3. Creates `claude/<branch>-<UTC timestamp>` at that commit and checks out the snapshot's files with the index at `HEAD`: the work in progress shows as uncommitted changes.
 4. Refuses to overwrite dirty leftovers for a new non-resume task.
-5. Starts a per-user tmux session and a Docker container.
+5. Starts a per-user tmux session under the developer's account. With `.remote-claude/Dockerfile` the job runs in a container instead.
 6. Reuses the checkout and server branch for `--server --resume`.
 
-There is a hard limit of two tmux jobs per account. A separate read-only root helper enumerates running labeled containers to warn about another account working on the same repository. This check is non-atomic, sees running containers only and is bypassed by `--force-new`.
+Jobs run unattended, so they allow every tool (`acceptEdits` plus `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebFetch`, `WebSearch`). Deny rules, which take precedence in every permission mode, block `gh pr merge`, merge API calls, force pushes, mirror pushes and remote branch deletion. These rules are not a complete Git security policy. Use branch protection and least-privilege hosting tokens.
+
+There is a hard limit of two tmux jobs per account. A separate read-only root helper enumerates running labeled containers to warn about another account working on the same repository. This check is non-atomic and is bypassed by `--force-new`.
 
 ### Containers
 
-The image comes from `.remote-claude/Dockerfile` (with only that directory as build context) or `remote-claude-job-base:latest`. The default image is Ubuntu 24.04 with common development tools.
-
-Runtime properties include:
+With `.remote-claude/Dockerfile` (built with only that directory as context) the job runs in a container with:
 
 - developer UID/GID;
 - all capabilities dropped and `no-new-privileges`;
@@ -193,9 +197,7 @@ Runtime properties include:
 
 This is not a hostile-user sandbox. Project Dockerfiles execute root build steps, the home directory is mounted and networking is shared with the host.
 
-Claude permissions pre-approve selected status/diff/log/add/commit/push and PR create/view operations, and deny common force-push/merge spellings. These rules are not a complete Git security policy. Use branch protection and least-privilege hosting tokens.
-
-`night` uses an existing absolute server Git checkout and does not prepare a branch. It rejects mounted workstation projects.
+`night` uses an existing absolute server Git checkout and does not prepare a branch. It rejects workstation projects.
 
 ## 10. Resource control
 

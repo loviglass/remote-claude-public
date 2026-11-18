@@ -1,0 +1,4 @@
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowTcpForwarding yes
+HostKey /etc/ssh/e2e_host_ed25519_key

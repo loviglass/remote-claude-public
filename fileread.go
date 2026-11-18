@@ -13,11 +13,11 @@ const maxReadSnapshot = 256 << 10
 // edits on the workstation are visible on the next open. Large files stream.
 func (w *worker) readFileSnapshot(q ExecRequest, out io.Writer) ExecResult {
 	p, ok := q.Spec["path"].(string)
-	if !ok || projectedConfig(p) {
+	if !ok {
 		return ExecResult{Code: 3}
 	}
 	p, err := cleanPath(p)
-	if err != nil {
+	if err != nil || projectedConfig(p) {
 		return ExecResult{Code: 3}
 	}
 	st, err := w.fs.root.Stat(fsPath(p))

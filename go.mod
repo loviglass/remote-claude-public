@@ -13,6 +13,10 @@ require (
 	mvdan.cc/sh/v3 v3.14.1
 )
 
-require github.com/kr/fs v0.1.0 // indirect
+require (
+	github.com/creack/pty v1.1.24 // indirect
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
+	github.com/kr/fs v0.1.0 // indirect
+)
 
 replace github.com/pkg/sftp => ./third_party/sftp

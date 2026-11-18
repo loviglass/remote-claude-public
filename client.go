@@ -266,9 +266,10 @@ func connect(args []string) (result error) {
 	}
 	defer client.Close()
 	trace("data SSH connected")
-	if e := installAvailableUpdate(client); e != nil {
-		return e
-	}
+	// The update check overlaps session preparation; an update restarts the
+	// client before Claude starts, and the restarted client rebinds.
+	updated := make(chan error, 1)
+	go func() { updated <- installAvailableUpdate(client) }()
 	hash := sha256.Sum256([]byte(p.Identity + "\x00" + root))
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -284,14 +285,9 @@ func connect(args []string) (result error) {
 		}
 	}()
 	id := hex.EncodeToString(hash[:12])
-	b, e := runSSH(client, serverBinary+" server location "+id, nil)
+	locationCache := filepath.Join(configDir(), *profile, "server-state.json")
+	location, e := projectLocation(client, locationCache, id, false)
 	if e != nil {
-		return e
-	}
-	var location struct {
-		Root string `json:"root"`
-	}
-	if e = json.Unmarshal(b, &location); e != nil {
 		return e
 	}
 	trace("workspace location")
@@ -299,9 +295,8 @@ func connect(args []string) (result error) {
 	if e != nil {
 		return e
 	}
-	cfg := SessionConfig{Protocol: protocolVersion, Secret: randomID(), HostKey: string(ssh.MarshalAuthorizedKey(signer.PublicKey())), LocalRoot: root, RemoteRoot: location.Root, OS: runtime.GOOS, Shell: os.Getenv("SHELL"), ID: id, Args: claudeArgs, FreshMetadata: *freshMetadata, ConfigSnapshot: true, GitSnapshot: true, ExtraConfig: true}
+	cfg := SessionConfig{Protocol: protocolVersion, Secret: randomID(), HostKey: string(ssh.MarshalAuthorizedKey(signer.PublicKey())), LocalRoot: root, RemoteRoot: location, OS: runtime.GOOS, Shell: os.Getenv("SHELL"), ID: id, FreshMetadata: *freshMetadata, Replica: true}
 	cfg.LocalSearch = !*serverSearch && workstationSearchAvailable()
-	cfg.BulkRead = true
 	if *shell != "auto" && *shell != "bash" && *shell != "powershell" {
 		return fmt.Errorf("shell must be auto, bash, or powershell")
 	}
@@ -318,7 +313,7 @@ func connect(args []string) (result error) {
 		return e
 	}
 	defer ln.Close()
-	w := &worker{config: cfg, fs: &projectFS{root: r}, signer: signer, close: make(chan struct{})}
+	w := &worker{config: cfg, fs: &projectFS{root: r}, signer: signer, close: make(chan struct{}), ignores: loadIgnoreRules(root), synced: make(chan *syncPC, 1)}
 	defer w.cleanup()
 	httpProxies := &httpMCPProxies{listen: client.Listen, worker: w}
 	defer httpProxies.close()
@@ -347,21 +342,40 @@ func connect(args []string) (result error) {
 			}()
 		}
 	}()
+	dataLost := make(chan struct{})
+	go func() {
+		client.Wait()
+		close(dataLost)
+	}()
+	go keepConnectionAlive(client, dataLost)
 	body, _ := json.Marshal(cfg)
-	b, e = runSSH(client, serverBinary+" server prepare", body)
+	b, e := runSSH(client, serverBinary+" server prepare", body)
 	if e != nil {
+		if u := <-updated; u != nil {
+			return u
+		}
+		if strings.Contains(e.Error(), "invalid protocol or workspace") {
+			// A cached server location went stale; the next attempt asks.
+			os.Remove(locationCache)
+			return fmt.Errorf("%w: %w", e, net.ErrClosed)
+		}
 		return e
 	}
 	var ready struct {
 		Session string `json:"session"`
+		Running bool   `json:"running"`
 	}
 	if e = json.Unmarshal(b, &ready); e != nil {
 		return e
 	}
-	trace("workspace prepared")
-	defer func() { cleanupRemoteSession(client, ready.Session) }()
-	// Keep interactive output off the TCP stream carrying SFTP and build output.
-	// A lost file-transfer packet should not block terminal channel delivery.
+	trace("session host bound")
+	if e := <-updated; e != nil {
+		return e
+	}
+	if e := waitInitialSync(w, dataLost, interactive); e != nil {
+		return e
+	}
+	trace("project synchronised")
 	terminalClient, e := terminalDial.wait()
 	if e != nil {
 		return e
@@ -369,7 +383,7 @@ func connect(args []string) (result error) {
 	defer terminalClient.Close()
 	trace("terminal SSH connected")
 	go func() {
-		client.Wait()
+		<-dataLost
 		terminalClient.Close()
 	}()
 	if *doctor {
@@ -393,24 +407,131 @@ func connect(args []string) (result error) {
 		os.Stdout.Write(b)
 		return e
 	}
-	if *prompt == "" {
+	params := encode(attachParams{Env: terminalEnvironment(), Args: claudeArgs})
+	if !interactive {
+		return runRemoteTerminal(terminalClient, serverBinary+" server run "+ready.Session+" "+params, false)
+	}
+	if ready.Running {
+		fmt.Fprintln(os.Stderr, "Reattaching:", p.User+"@"+p.Host, "| project:", root, "| commands:", runtime.GOOS)
+	} else {
 		fmt.Fprintln(os.Stderr, "Connected:", p.User+"@"+p.Host, "| project:", root, "| commands:", runtime.GOOS)
 	}
-	return runRemoteTerminal(terminalClient, serverBinary+" server attach "+ready.Session, *prompt == "")
+	return runRemoteTerminal(terminalClient, serverBinary+" server attach "+ready.Session+" "+params, true)
 }
 
-// A dead data SSH connection must not keep a reconnecting child process stuck
-// in cleanup. The next preparation can reclaim a lock whose bridge is gone.
-func cleanupRemoteSession(client *ssh.Client, id string) {
-	done := make(chan struct{})
-	go func() {
-		runSSH(client, serverBinary+" server cleanup "+id, nil)
-		close(done)
-	}()
+// projectLocation finds the server path of this project's replica. The server
+// state directory is cached per profile, saving a round trip on every start.
+func projectLocation(client *ssh.Client, cache, id string, fresh bool) (string, error) {
+	suffix := "/projects/" + id + "/worktree"
+	var cached struct {
+		StateDir string `json:"state_dir"`
+	}
+	if !fresh && readJSON(cache, &cached) == nil && strings.HasPrefix(cached.StateDir, "/") {
+		return cached.StateDir + suffix, nil
+	}
+	b, e := runSSH(client, serverBinary+" server location "+id, nil)
+	if e != nil {
+		return "", e
+	}
+	var location struct {
+		Root string `json:"root"`
+	}
+	if e = json.Unmarshal(b, &location); e != nil {
+		return "", e
+	}
+	if strings.HasSuffix(location.Root, suffix) {
+		cached.StateDir = strings.TrimSuffix(location.Root, suffix)
+		writeJSON(cache, cached)
+	}
+	return location.Root, nil
+}
+
+// waitInitialSync blocks until the replica matches the project, showing
+// progress when the first transfer of a project takes a while.
+func waitInitialSync(w *worker, lost <-chan struct{}, show bool) error {
+	var s *syncPC
 	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
+	case s = <-w.synced:
+	case <-lost:
+		return fmt.Errorf("connection lost during synchronisation: %w", net.ErrClosed)
+	case <-time.After(time.Minute):
+		return fmt.Errorf("the server did not start project synchronisation")
+	}
+	start := time.Now()
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	shown := false
+	for {
+		select {
+		case <-s.ready:
+			if shown {
+				fmt.Fprintf(os.Stderr, "\rProject synchronised: %d files, %.1f MB in %.1fs.        \n", s.sentFiles.Load(), float64(s.sentBytes.Load())/1e6, time.Since(start).Seconds())
+			}
+			return nil
+		case <-s.done:
+			return fmt.Errorf("project synchronisation stopped: %w", net.ErrClosed)
+		case <-lost:
+			return fmt.Errorf("connection lost during synchronisation: %w", net.ErrClosed)
+		case <-tick.C:
+			if show && time.Since(start) > time.Second {
+				shown = true
+				fmt.Fprintf(os.Stderr, "\rSynchronising project: %d files, %.1f MB...", s.sentFiles.Load(), float64(s.sentBytes.Load())/1e6)
+			}
+		}
+	}
+}
+
+// The workstation side of the terminal is reproduced for Claude, so colours,
+// key handling and notifications match the local terminal.
+func terminalEnvironment() map[string]string {
+	env := map[string]string{}
+	for _, k := range []string{"TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"} {
+		if v := os.Getenv(k); v != "" {
+			env[k] = v
+		}
+	}
+	if env["TERM"] == "" || env["TERM"] == "dumb" {
+		env["TERM"] = "xterm-256color"
+	}
+	if runtime.GOOS == "windows" && env["COLORTERM"] == "" && os.Getenv("WT_SESSION") != "" {
+		env["COLORTERM"] = "truecolor"
+	}
+	for _, k := range []string{"LC_ALL", "LANG"} {
+		if v := os.Getenv(k); strings.Contains(strings.ToUpper(v), "UTF-8") || strings.Contains(strings.ToUpper(v), "UTF8") {
+			env["LANG"] = v
+			break
+		}
+	}
+	if env["LANG"] == "" {
+		env["LANG"] = "C.UTF-8"
+	}
+	return env
+}
+
+// keepConnectionAlive closes a connection whose peer stopped answering, so a
+// silently dead link turns into a prompt reconnect.
+func keepConnectionAlive(client *ssh.Client, stop <-chan struct{}) {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		done := make(chan error, 1)
+		go func() { _, _, e := client.SendRequest("keepalive@openssh.com", true, nil); done <- e }()
+		select {
+		case e := <-done:
+			if e == nil {
+				continue
+			}
+		case <-time.After(30 * time.Second):
+		case <-stop:
+			return
+		}
 		client.Close()
+		return
 	}
 }
 
@@ -445,7 +566,7 @@ func runRemoteTerminal(client *ssh.Client, command string, interactive bool) err
 		if e != nil {
 			width, height = 100, 30
 		}
-		if e = s.RequestPty("xterm-256color", height, width, ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 38400, ssh.TTY_OP_OSPEED: 38400}); e != nil {
+		if e = s.RequestPty(terminalEnvironment()["TERM"], height, width, ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 38400, ssh.TTY_OP_OSPEED: 38400}); e != nil {
 			return e
 		}
 		state, e := term.MakeRaw(int(os.Stdin.Fd()))
@@ -460,42 +581,32 @@ func runRemoteTerminal(client *ssh.Client, command string, interactive bool) err
 	}
 	stop := make(chan struct{})
 	defer close(stop)
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		lastW, lastH, count := 0, 0, 0
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				count++
-				if terminal {
-					a, b, e := term.GetSize(int(os.Stdin.Fd()))
-					if e == nil && (a != lastW || b != lastH) {
-						s.WindowChange(b, a)
-						lastW, lastH = a, b
-					}
+	if terminal {
+		// Resizes propagate at once on Unix; Windows consoles are polled.
+		winch := resizeSignals()
+		poll := time.NewTicker(250 * time.Millisecond)
+		if winch != nil {
+			poll.Stop()
+		}
+		go func() {
+			defer poll.Stop()
+			lastW, lastH := 0, 0
+			for {
+				select {
+				case <-stop:
+					return
+				case <-winch:
+				case <-poll.C:
 				}
-				if count%15 == 0 {
-					go func() {
-						done := make(chan error, 1)
-						go func() { _, _, e := client.SendRequest("keepalive@openssh.com", true, nil); done <- e }()
-						select {
-						case e := <-done:
-							if e != nil {
-								client.Close()
-							}
-						case <-time.After(30 * time.Second):
-							client.Close()
-						case <-stop:
-							return
-						}
-					}()
+				a, b, e := term.GetSize(int(os.Stdin.Fd()))
+				if e == nil && (a != lastW || b != lastH) {
+					s.WindowChange(b, a)
+					lastW, lastH = a, b
 				}
 			}
-		}
-	}()
+		}()
+	}
+	go keepConnectionAlive(client, stop)
 	e = s.Run(command)
 	clean = e == nil
 	if aborted.Load() {
