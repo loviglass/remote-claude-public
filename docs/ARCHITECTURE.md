@@ -41,7 +41,7 @@ The server path of the replica is cached per profile, and the update check overl
 
 Only Ed25519 server host keys are accepted. The bridge itself has a random per-session secret and an ephemeral host key. The workstation listener uses `127.0.0.1:0`; no public listener is created.
 
-The server-side SSHFS options include short one-second attribute/entry/directory cache timeouts. `--fresh-metadata` disables these caches.
+The live SSHFS view (§5) uses short one-second attribute/entry/directory cache timeouts. `--fresh-metadata` and `--server-search` are accepted for compatibility; the replica made them unnecessary.
 
 ## 3. Enrollment
 
@@ -60,7 +60,7 @@ A lost enrollment acknowledgement can be recovered: if the newly generated key a
 
 ## 4. Command transport
 
-Claude receives `CLAUDE_CODE_SHELL_PREFIX`, which routes supported shell invocations through the adapter. The adapter unwraps Claude's shell wrapper, translates the mounted server project path to the local path and sends a versioned execution request.
+Claude receives `CLAUDE_CODE_SHELL_PREFIX`, which routes supported shell invocations through the adapter. The adapter unwraps Claude's shell wrapper, translates the server replica path to the local path and sends a versioned execution request.
 
 The main execution paths are:
 
@@ -125,7 +125,7 @@ Searches without `--no-ignore*`, `-u` or `--follow` run with the server's ripgre
 
 ## 7. Project configuration, hooks and MCP
 
-The mounted repository provides native discovery of:
+The replica provides native discovery of:
 
 - `CLAUDE.md` and nested instructions;
 - `.claude/rules`;
